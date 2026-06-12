@@ -76,70 +76,31 @@ def load_sido_hydrant_data():
     # 법적 기준 미달율 계산: 면적 대비 소화전 수가 적을수록 값이 커짐
     # 시각화 안정성을 위해 최소 8.5%, 최대 89.2%로 범위를 제한(clip)함
     df["법적기준_미달율"] = (
-        (df["면적_B"] / df["소화전개소_A"]) * 300 + 12
-    ).clip(lower=8.5, upper=89.2).round(1) 
+        (df["면적_B"] / df["소화전개소_A"].replace(0, np.nan)) * 300 + 12
+    ).fillna(89.2).clip(lower=8.5, upper=89.2).round(1) 
 
     return df
 
 
-# `last.csv`가 있으면 취약도(지역별)를 우선 사용하고, 없으면 기존 `final_merged_data.csv`를 사용합니다.
-df_sido = None
-for candidate_sido in ["last.csv", "final_merged_data.csv"]:
-    if os.path.exists(candidate_sido):
-        try:
-            df_sido = pd.read_csv(candidate_sido)
-            break
-        except Exception:
-            df_sido = None
-
-# 데이터 파일이 없을 경우 더미 데이터를 사용하여 앱이 켜지도록 보장합니다.
-if df_sido is None:
-    st.info("외부 데이터 파일을 찾을 수 없어 시스템 시뮬레이션 데이터를 로드합니다.")
-    df_sido = load_sido_hydrant_data()
-    # 더미 데이터 사용 시 컬럼 표준화 및 계산 단계를 건너뛰기 위해 플래그 설정
-    skip_processing = True
-else:
-    skip_processing = False
-    df_sido = standardize_sido_columns(df_sido)
-
 def standardize_sido_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    cols = set(df.columns)
+    # 기존 유연한 매핑 로직 유지
+    mapping = {
+        "면적": "면적_B", "총면적_km2": "면적_B", "총면적_m2": "면적_B_m2",
+        "화재건수": "화재발생건수_C", "소화전_개수": "소화전개소_A", "소화전 개수": "소화전개소_A"
+    }
+    for src, dst in mapping.items():
+        if src in df.columns and dst not in df.columns:
+            if dst == "면적_B_m2":
+                df["면적_B"] = df[src] / 1_000_000
+            else:
+                df[dst] = df[src]
 
-    # 면적: 총면적_km2 또는 총면적_m2
-    if "총면적_km2" in cols and "면적_B" not in cols:
-        df["면적_B"] = df["총면적_km2"]
-    elif "총면적_m2" in cols and "면적_B" not in cols:
-        df["면적_B"] = df["총면적_m2"] / 1_000_000
-
-    # 소화전 수
-    if "소화전_개수" in cols and "소화전개소_A" not in cols:
-        df["소화전개소_A"] = df["소화전_개수"].astype(float)
-    if "소화전 개수" in cols and "소화전개소_A" not in cols:
-        df["소화전개소_A"] = df["소화전 개수"].astype(float)
-
-    # 화재 건수
-    if "화재건수" in cols and "화재발생건수_C" not in cols:
-        df["화재발생건수_C"] = df["화재건수"].astype(float)
-
-    # 이미 밀도 컬럼이 있는 경우 매핑
-    if "소화전_밀도" in cols and "소화전_밀도_D" not in cols:
-        df["소화전_밀도_D"] = df["소화전_밀도"].astype(float)
-    if "화재_위험도" in cols and "화재_발생_밀도_E" not in cols:
-        # 화재_위험도가 밀도와 직접 매칭되지 않으므로 우선 화재건수/면적으로 계산
-        if "화재발생건수_C" in df.columns and "면적_B" in df.columns:
-            df["화재_발생_밀도_E"] = (df["화재발생건수_C"] / df["면적_B"]).astype(float)
-
-    # 필요시 밀도값 재계산
-    if "소화전_밀도_D" not in df.columns and "소화전개소_A" in df.columns and "면적_B" in df.columns:
+    if "면적_B" in df.columns and "소화전개소_A" in df.columns:
         df["소화전_밀도_D"] = (df["소화전개소_A"] / df["면적_B"]).astype(float)
-    if "화재_발생_밀도_E" not in df.columns and "화재발생건수_C" in df.columns and "면적_B" in df.columns:
+    if "면적_B" in df.columns and "화재발생건수_C" in df.columns:
         df["화재_발생_밀도_E"] = (df["화재발생건수_C"] / df["면적_B"]).astype(float)
-
-    # 시도명 컬럼 표준화
-    if "행정구역_키" in cols and "시도명" not in cols:
-        df["시도명"] = df["행정구역_키"]
-
+    
     return df
 
 
@@ -154,29 +115,134 @@ def normalize_coord_columns(df):
     return df.rename(columns=rename)
 
 
-def load_hydrant_point_data(source):
+@st.cache_data
+def load_and_merge_new_data():
+    """제공된 3개의 CSV 파일을 로드하여 통합 데이터프레임을 생성"""
     try:
-        df_h = pd.read_csv(source)
-    except Exception:
-        return None
-    df_h = normalize_coord_columns(df_h)
-    if "latitude" in df_h.columns and "longitude" in df_h.columns:
-        return df_h
-    return None
+        # 1. 데이터 로드 (BOM 대응을 위해 utf-8-sig 사용)
+        df_area = pd.read_csv('전국면적.csv', encoding='utf-8-sig')
+        df_fire = pd.read_csv('화재발생.csv', encoding='utf-8-sig')
+        df_hydrants_raw = pd.read_csv('소화전.csv', encoding='utf-8-sig') if os.path.exists('소화전.csv') else None
+        
+        # 2. 행정구역 데이터 전처리 (시·도 + 시·군·구 계층 구조 처리)
+        df_area.columns = [c.replace('\ufeff', '') for c in df_area.columns]
+        df_area.rename(columns={'소재지(시군구)별': '지역명_raw', '2025': '면적_B'}, inplace=True)
 
-hydrant_points = None
-for candidate in [
-    "data.csv",
-    "hydrant_locations.csv",
-    "individual_hydrants.csv",
-    "hydrant_points.csv",
-    "소화전_좌표.csv",
-    "final_merged_coords.csv",
-]:
-    if os.path.exists(candidate):
-        hydrant_points = load_hydrant_point_data(candidate)
-        if hydrant_points is not None:
-            break
+        sidos = ["서울특별시", "부산광역시", "대구광역시", "인천광역시", "광주광역시", "대전광역시", "울산광역시", 
+                 "세종특별자치시", "경기도", "강원특별자치도", "충청북도", "충청남도", "전북특별자치도", 
+                 "전라남도", "경상북도", "경상남도", "제주특별자치도"]
+        
+        # 면적 데이터에서 시도-시군구 관계 생성
+        area_list = []
+        curr_sido = None
+        for _, row in df_area.iterrows():
+            name = str(row['지역명_raw']).strip()
+            if name in sidos:
+                curr_sido = name
+                if name == "세종특별자치시": # 세종시는 시도이자 시군구
+                    area_list.append({'시도명': curr_sido, '시군구명': curr_sido, '면적_B': row['면적_B']})
+            elif curr_sido:
+                area_list.append({'시도명': curr_sido, '시군구명': name, '면적_B': row['면적_B']})
+        df_area_processed = pd.DataFrame(area_list)
+
+        # 화재 데이터 전처리
+        df_fire.rename(columns={'행정구역별(1)': '시도명', '행정구역별(2)': '시군구명', '2025': '화재발생건수_C'}, inplace=True)
+        df_fire = df_fire[df_fire['시군구명'] != '소계'].copy()
+        df_fire['시군구명'] = df_fire['시군구명'].replace('세종시', '세종특별자치시')
+        
+        # 3. 소화전 데이터 집계 (주소 분석을 통한 시군구 단위 카운트)
+        if df_hydrants_raw is not None:
+            addr_cols = ['시도명', '시도', '지역', '주소', 'location', '소재지', '설치위치', '설치장소', '도로명주소', '지번주소', '소재지도로명주소', '설치장소']
+            target_col = next((c for c in addr_cols if c in df_hydrants_raw.columns), None)
+            
+            if target_col:
+                sido_map = {
+                    "서울": "서울특별시", "부산": "부산광역시", "대구": "대구광역시", "인천": "인천광역시",
+                    "광주": "광주광역시", "대전": "대전광역시", "울산": "울산광역시", "세종": "세종특별자치시",
+                    "경기": "경기도", "강원": "강원특별자치도", "충북": "충청북도", "충남": "충청남도",
+                    "전북": "전북특별자치도", "전남": "전라남도", "경북": "경상북도", "경남": "경상남도", "제주": "제주특별자치도"
+                }
+                def parse_addr(val):
+                    if not isinstance(val, str) or not val.strip(): return "기타", "기타"
+                    val = val.strip()
+                    
+                    # 1. 시도명 찾기 (긴 명칭 우선 매칭으로 정확도 향상)
+                    sido = "기타"
+                    matched_prefix = ""
+                    for s in sidos:
+                        if val.startswith(s):
+                            sido = s
+                            matched_prefix = s
+                            break
+                    if sido == "기타":
+                        for short, full in sido_map.items():
+                            if val.startswith(short):
+                                sido = full
+                                matched_prefix = short
+                                break
+                    
+                    # 2. 시군구명 추출 (시도명/접두사 제거 후 첫 단어)
+                    remaining = val[len(matched_prefix):].strip() if matched_prefix else val
+                    parts = remaining.split()
+                    sigungu = parts[0] if parts else sido
+                    return sido, sigungu
+
+                # 성능 최적화: pd.Series 대신 리스트 컴프리헨션 사용 (속도 향상)
+                parsed_results = df_hydrants_raw[target_col].apply(parse_addr)
+                df_hydrants_raw['시도명_std'] = [res[0] for res in parsed_results]
+                df_hydrants_raw['시군구명_std'] = [res[1] for res in parsed_results]
+                df_h_count = df_hydrants_raw.groupby(['시도명_std', '시군구명_std']).size().reset_index(name='소화전개소_A')
+                
+                # 위경도 데이터가 있다면 시군구별 평균 좌표 계산
+                hydrants_mapped = normalize_coord_columns(df_hydrants_raw)
+                if 'latitude' in hydrants_mapped.columns and 'longitude' in hydrants_mapped.columns:
+                    coords_agg = hydrants_mapped.groupby(['시도명_std', '시군구명_std'])[['latitude', 'longitude']].mean().reset_index()
+                    df_h_count = pd.merge(df_h_count, coords_agg, on=['시도명_std', '시군구명_std'], how='left')
+                
+                df_h_count.rename(columns={'시도명_std': '시도명', '시군구명_std': '시군구명'}, inplace=True)
+            else:
+                df_h_count = pd.DataFrame(columns=['시도명', '소화전개소_A'])
+        else:
+            df_h_count = pd.DataFrame(columns=['시도명', '시군구명', '소화전개소_A'])
+
+        # 4. 데이터 병합 (시도명 + 시군구명 기준)
+        merged = pd.merge(df_area_processed, df_fire, on=['시도명', '시군구명'], how='inner')
+        merged = pd.merge(merged, df_h_count, on=['시도명', '시군구명'], how='left')
+        
+        # 데이터 매칭 확인을 위한 알림
+        zero_count = merged['소화전개소_A'].isna().sum()
+        if zero_count > 0:
+            st.sidebar.info(f"ℹ️ {zero_count}개 지역은 소화전 데이터가 없거나 주소 형식이 다릅니다.")
+
+        merged['소화전개소_A'] = merged['소화전개소_A'].fillna(0)
+        
+        # 표시용 지역명 생성
+        merged['시도명_full'] = merged['시도명']
+        merged['시도명'] = merged['시도명'] + " " + merged['시군구명']
+        
+        return merged, df_hydrants_raw
+    except Exception as e:
+        st.error(f"데이터 파일 로드 중 오류 발생: {e}")
+        return None, None
+
+# 신규 데이터 로드 시도
+if os.path.exists('전국면적.csv') and os.path.exists('화재발생.csv') and os.path.exists('소화전.csv'):
+    df_sido, hydrant_points_raw = load_and_merge_new_data()
+    if df_sido is not None:
+        skip_processing = False
+        df_sido = standardize_sido_columns(df_sido)
+        # 개 개별 좌표 데이터 정규화
+        hydrant_points = normalize_coord_columns(hydrant_points_raw) if hydrant_points_raw is not None else None
+    else:
+        st.info("신규 데이터를 통합하는 데 실패하여 시뮬레이션 데이터를 사용합니다.")
+        df_sido = load_sido_hydrant_data()
+        skip_processing = True
+        hydrant_points = None
+else:
+    st.info("제공된 3개의 데이터 파일(전국면적, 소화전, 화재발생) 중 일부를 찾을 수 없어 시뮬레이션 데이터를 로드합니다.")
+    df_sido = load_sido_hydrant_data()
+    skip_processing = True
+    hydrant_points = None
 
 # CSV 컬럼을 앱에서 사용하는 컬럼명으로 맞춥니다.
 column_map = {
@@ -215,8 +281,8 @@ if not skip_processing:
 
     if "법적기준_미달율" not in df_sido.columns:
         df_sido["법적기준_미달율"] = (
-            (df_sido["면적_B"] / df_sido["소화전개소_A"]) * 300 + 12
-        ).clip(lower=8.5, upper=89.2).round(1)
+            (df_sido["면적_B"] / df_sido["소화전개소_A"].replace(0, np.nan)) * 300 + 12
+        ).fillna(89.2).clip(lower=8.5, upper=89.2).round(1)
 
 # 지도 표시를 위해 광역 단위 좌표를 부여합니다.
 province_coords = {
@@ -259,11 +325,18 @@ province_coords = {
 def normalize_region_name(name: str):
     if not isinstance(name, str):
         return ""
-    text = name.strip().replace("　", " ").replace("\u3000", " ")
+    text = name.strip().replace("\u3000", " ")
     text = " ".join(text.split())
-    for bad, good in alias_prefixes.items():
-        if bad in text:
-            text = text.replace(bad, good)
+    # 시군구 단위에서는 "경기도 수원시" 형태로 들어옴
+    if " " in text:
+        parts = text.split()
+        sido_prefix = parts[0][:2]
+        # 시도명 매핑 찾기
+        for key, val in province_coords.items():
+            if key.startswith(sido_prefix):
+                parts[0] = key
+                break
+        return " ".join(parts)
     return text
 
 if "latitude" not in df_sido.columns or "longitude" not in df_sido.columns:
@@ -306,7 +379,7 @@ def render_vulnerability_map(data):
 # ==========================================
 # 2. 메인 화면
 # ==========================================
-st.title("🚒 전국 시·도별 소화전 배치 격차 및 소방 취약지역 도출 시스템")
+st.title("🚒 전국 시·군·구별 소화전 배치 격차 및 소방 취약지역 도출 시스템")
 st.subheader("소방기본법 규정 사각지대 분석 및 지리 공간적 인프라 대안 도출")
 st.divider()
 
@@ -341,8 +414,8 @@ st.sidebar.title("🔍 분석 단계 선택")
 menu = st.sidebar.radio(
     "이동할 단계를 선택하세요:",
     [
-        "🗺️ Step 1. 전국 시·도 공간 지리 맵핑",
-        "📊 Step 2. 취약 격차 4분면 매트릭스 진단",
+        "🗺️ Step 1. 전국 시·군·구 공간 지리 맵핑",
+        " Step 2. 취약 격차 4분면 매트릭스 진단",
         "💡 Step 3. 우선순위 정책 제언 및 대안",
     ]
 )
@@ -350,9 +423,9 @@ menu = st.sidebar.radio(
 # ------------------------------------------
 # Tab 1 — 공간 지리 맵핑
 # ------------------------------------------
-if menu == "🗺️ Step 1. 전국 시·도 공간 지리 맵핑":
-    st.header("🗺️ 전국 시·도별 소방 취약 인프라 공간 시각화")
-    st.markdown("전국 17개 시·도의 취약 지수를 지도로 확인하고 기준점으로 필터링합니다.")
+if menu == "🗺️ Step 1. 전국 시·군·구 공간 지리 맵핑":
+    st.header("🗺️ 전국 시·군·구별 소방 취약 인프라 공간 시각화")
+    st.markdown("전국 기초 지자체의 취약 지수를 지도로 확인하고 기준점으로 필터링합니다.")
 
     valid_scores = df_sido["취약_지수"].replace([np.inf, -np.inf], np.nan).dropna()
     if valid_scores.empty:
@@ -397,7 +470,7 @@ if menu == "🗺️ Step 1. 전국 시·도 공간 지리 맵핑":
             ]]
             .sort_values(by="취약_지수", ascending=False)
         )
-        st.dataframe(styled_df, use_container_width=True)
+        st.dataframe(styled_df, width="stretch")
 
 # ------------------------------------------
 # Tab 2 — 4분면 매트릭스 진단
@@ -451,7 +524,7 @@ elif menu == "📊 Step 2. 취약 격차 4분면 매트릭스 진단":
         legend_title_text='4분면 분류',
         yaxis={'categoryorder':'total ascending'}
     )
-    st.plotly_chart(fig_bar, use_container_width=True)
+    st.plotly_chart(fig_bar, width="stretch")
 
     st.divider()
 
