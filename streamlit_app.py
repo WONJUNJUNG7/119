@@ -256,13 +256,6 @@ province_coords = {
     "서울특별시": (37.5665, 126.9780),
 }
 
-alias_prefixes = {
-    "전란남도": "전라남도",
-    "전란북도": "전라북도",
-    "칠곡군칠곡군": "경상북도",
-    "울진군울진군": "경상북도",
-}
-
 def normalize_region_name(name: str):
     if not isinstance(name, str):
         return ""
