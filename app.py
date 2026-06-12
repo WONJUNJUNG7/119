@@ -12,8 +12,11 @@ st.write('화재 발생률과 소화전 밀도 간의 상관관계를 분석합�
 @st.cache_data
 def load_data():
     # Ensure the path is correct if running in a different environment
-    df = pd.read_csv('final_merged_data.csv')
-    return df
+    try:
+        df = pd.read_csv('final_merged_data.csv')
+        return df
+    except Exception:
+        return None
 
 df = load_data()
 

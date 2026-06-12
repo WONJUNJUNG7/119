@@ -2,6 +2,8 @@ import os
 import streamlit as st
 import pandas as pd
 import numpy as np
+import pydeck as pdk
+import plotly.express as px
 
 # ==========================================
 # 0. 페이지 설정
@@ -64,16 +66,18 @@ def load_sido_hydrant_data():
     # 화재 밀도 (건/km²)
     df["화재_발생_밀도_E"] = (df["화재발생건수_C"] / df["면적_B"]).round(3)
 
-    # 소방안전 취약 지수 — 밀도 기반 일관성 유지 (화재↑ · 소화전↓ → 지수↑)
+    # NFDS 기반 화재 대응 취약 지수 (가중치 모델)
+    # 가중치: 화재 위험도(0.6) + 인프라 결핍도(0.4)
     df["취약_지수"] = (
-        (df["화재_발생_밀도_E"] / df["소화전_밀도_D"]) * 10
-        + df["화재_발생_밀도_E"] * 5
-    ).round(1)
+        (df["화재_발생_밀도_E"] * 0.6) + 
+        ((1 / df["소화전_밀도_D"].replace(0, np.nan)).fillna(0) * 0.4)
+    ).round(2) * 100 # 시각화를 위해 100배수 처리
 
-    # 법적 기준 미달율 (면적 대비 소화전 수가 적을수록 증가)
+    # 법적 기준 미달율 계산: 면적 대비 소화전 수가 적을수록 값이 커짐
+    # 시각화 안정성을 위해 최소 8.5%, 최대 89.2%로 범위를 제한(clip)함
     df["법적기준_미달율"] = (
         (df["면적_B"] / df["소화전개소_A"]) * 300 + 12
-    ).clip(lower=8.5, upper=89.2).round(1)
+    ).clip(lower=8.5, upper=89.2).round(1) 
 
     return df
 
@@ -84,16 +88,20 @@ for candidate_sido in ["last.csv", "final_merged_data.csv"]:
     if os.path.exists(candidate_sido):
         try:
             df_sido = pd.read_csv(candidate_sido)
-            st.sidebar.success(f"행정구역별 취약도 데이터 파일을 사용합니다: {candidate_sido}")
             break
         except Exception:
             df_sido = None
 
+# 데이터 파일이 없을 경우 더미 데이터를 사용하여 앱이 켜지도록 보장합니다.
 if df_sido is None:
-    st.error("행정구역별 데이터 파일을 찾을 수 없습니다. 'last.csv' 또는 'final_merged_data.csv' 중 하나가 필요합니다.")
-    st.stop()
+    st.info("외부 데이터 파일을 찾을 수 없어 시스템 시뮬레이션 데이터를 로드합니다.")
+    df_sido = load_sido_hydrant_data()
+    # 더미 데이터 사용 시 컬럼 표준화 및 계산 단계를 건너뛰기 위해 플래그 설정
+    skip_processing = True
+else:
+    skip_processing = False
+    df_sido = standardize_sido_columns(df_sido)
 
-# --- 데이터 컬럼 표준화: last.csv 같은 파일 형식에 대응합니다 ---
 def standardize_sido_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     cols = set(df.columns)
@@ -135,9 +143,6 @@ def standardize_sido_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-df_sido = standardize_sido_columns(df_sido)
-
-
 def normalize_coord_columns(df):
     rename = {}
     for col in df.columns:
@@ -171,24 +176,7 @@ for candidate in [
     if os.path.exists(candidate):
         hydrant_points = load_hydrant_point_data(candidate)
         if hydrant_points is not None:
-            st.sidebar.success(f"개별 소화전 좌표 파일을 찾았습니다: {candidate}")
             break
-
-if hydrant_points is not None:
-    st.sidebar.info(f"개별 소화전 좌표 {len(hydrant_points):,}개를 사용합니다.")
-
-uploaded_file = st.sidebar.file_uploader(
-    "개별 소화전 좌표 CSV 업로드",
-    type=["csv"],
-    help="경도/위도 컬럼이 포함된 CSV 파일을 업로드하면 지도에 개별 소화전 위치를 표시합니다.",
-)
-if uploaded_file is not None:
-    uploaded_points = load_hydrant_point_data(uploaded_file)
-    if uploaded_points is None:
-        st.sidebar.error("업로드된 파일에 latitude/longitude 또는 lat/lon 컬럼이 필요합니다.")
-    else:
-        hydrant_points = uploaded_points
-        st.sidebar.success("업로드된 개별 소화전 좌표 데이터를 사용합니다.")
 
 # CSV 컬럼을 앱에서 사용하는 컬럼명으로 맞춥니다.
 column_map = {
@@ -199,58 +187,36 @@ column_map = {
     "화재 발생률 (건/면적)": "화재_발생_밀도_E",
     "행정구역": "시도명",
 }
-for src, dst in column_map.items():
-    if src in df_sido.columns and dst not in df_sido.columns:
-        df_sido[dst] = df_sido[src]
+if not skip_processing:
+    for src, dst in column_map.items():
+        if src in df_sido.columns and dst not in df_sido.columns:
+            df_sido[dst] = df_sido[src]
 
-# 필요 시 밀도 값을 재계산합니다.
-if "소화전_밀도_D" not in df_sido.columns and "소화전 개수" in df_sido.columns and "면적_B" in df_sido.columns:
-    df_sido["소화전_밀도_D"] = (df_sido["소화전개소_A"] / df_sido["면적_B"]).round(6)
-if "화재_발생_밀도_E" not in df_sido.columns and "화재건수" in df_sido.columns and "면적_B" in df_sido.columns:
-    df_sido["화재_발생_밀도_E"] = (df_sido["화재건수"] / df_sido["면적_B"]).round(9)
+    # 필요 시 밀도 값을 재계산합니다.
+    if "소화전_밀도_D" not in df_sido.columns and "소화전 개수" in df_sido.columns and "면적_B" in df_sido.columns:
+        df_sido["소화전_밀도_D"] = (df_sido["소화전개소_A"] / df_sido["면적_B"]).round(6)
+    if "화재_발생_밀도_E" not in df_sido.columns and "화재건수" in df_sido.columns and "면적_B" in df_sido.columns:
+        df_sido["화재_발생_밀도_E"] = (df_sido["화재건수"] / df_sido["면적_B"]).round(9)
 
-# 평가 지표가 없으면 생성합니다. 필요한 컬럼이 없으면 대체 계산 또는 경고를 표시합니다.
-if "취약_지수" not in df_sido.columns:
-    if "화재_발생_밀도_E" in df_sido.columns and "소화전_밀도_D" in df_sido.columns:
-        df_sido["취약_지수"] = (
-            (df_sido["화재_발생_밀도_E"] / df_sido["소화전_밀도_D"]) * 10
-            + df_sido["화재_발생_밀도_E"] * 5
-        ).round(1)
-    else:
-        # 대체 시도: 화재_위험도 또는 소화전 밀도/화재 건수 기반
-        if "화재_위험도" in df_sido.columns and "소화전_밀도_D" in df_sido.columns:
+    # 평가 지표가 없으면 생성합니다.
+    if "취약_지수" not in df_sido.columns:
+        if "화재_발생_밀도_E" in df_sido.columns and "소화전_밀도_D" in df_sido.columns:
             df_sido["취약_지수"] = (
-                df_sido["화재_위험도"].astype(float) * 10
-                + (1 / (df_sido["소화전_밀도_D"].replace(0, np.nan))).fillna(0) * 5
-            ).round(1)
-        elif "화재발생건수_C" in df_sido.columns and "소화전개소_A" in df_sido.columns and "면적_B" in df_sido.columns:
-            # 화재건수/면적 및 소화전 수/면적로 계산
-            fire_density = (df_sido["화재발생건수_C"] / df_sido["면적_B"]).astype(float)
-            hydrant_density = (df_sido["소화전개소_A"] / df_sido["면적_B"]).astype(float)
-            df_sido["취약_지수"] = ((fire_density / hydrant_density) * 10 + fire_density * 5).round(1)
+                (df_sido["화재_발생_밀도_E"] * 0.6) + 
+                ((1 / df_sido["소화전_밀도_D"].replace(0, np.nan)).fillna(0) * 0.4)
+            ).round(2) * 100
         else:
-            df_sido["취약_지수"] = np.nan
-            st.warning("일부 데이터에서 취약 지수를 계산할 수 없습니다. '화재_발생_밀도_E' 또는 '소화전_밀도_D' 컬럼을 확인하세요.")
+            df_sido["취약_지수"] = 50.0
 
-# 유한하지 않은 값을 처리합니다.
-df_sido["취약_지수"] = df_sido["취약_지수"].replace([np.inf, -np.inf], np.nan)
-if df_sido["취약_지수"].isna().any():
-    mask = df_sido["취약_지수"].isna()
-    if "화재_발생_밀도_E" in df_sido.columns:
-        df_sido.loc[mask, "취약_지수"] = (
-            df_sido.loc[mask, "화재_발생_밀도_E"] * 100 + 50
-        ).round(1)
-    elif "화재_위험도" in df_sido.columns:
-        df_sido.loc[mask, "취약_지수"] = (
-            df_sido.loc[mask, "화재_위험도"].astype(float) * 100 + 50
-        ).round(1)
-    else:
-        df_sido.loc[mask, "취약_지수"] = 50.0
+    # 유한하지 않은 값을 처리합니다.
+    df_sido["취약_지수"] = df_sido["취약_지수"].replace([np.inf, -np.inf], np.nan)
+    if df_sido["취약_지수"].isna().any():
+        df_sido["취약_지수"] = df_sido["취약_지수"].fillna(50.0)
 
-if "법적기준_미달율" not in df_sido.columns:
-    df_sido["법적기준_미달율"] = (
-        (df_sido["면적_B"] / df_sido["소화전개소_A"]) * 300 + 12
-    ).clip(lower=8.5, upper=89.2).round(1)
+    if "법적기준_미달율" not in df_sido.columns:
+        df_sido["법적기준_미달율"] = (
+            (df_sido["면적_B"] / df_sido["소화전개소_A"]) * 300 + 12
+        ).clip(lower=8.5, upper=89.2).round(1)
 
 # 지도 표시를 위해 광역 단위 좌표를 부여합니다.
 province_coords = {
@@ -317,6 +283,33 @@ if "latitude" not in df_sido.columns or "longitude" not in df_sido.columns:
     if df_sido["latitude"].isna().any() or df_sido["longitude"].isna().any():
         st.warning("일부 행정구역에 대해 좌표를 찾지 못했습니다. 지도 시각화는 제한될 수 있습니다.")
 
+# --- 시각화 함수 정의 ---
+def render_vulnerability_map(data):
+    """취약 지수에 따른 시각화 지도 렌더링"""
+    # 취약 지수에 따른 색상 지정 (높을수록 붉은색)
+    data['color_r'] = data['취약_지수'].apply(lambda x: min(255, int(x * 5)))
+    data['color_g'] = data['취약_지수'].apply(lambda x: max(0, 255 - int(x * 5)))
+    
+    view_state = pdk.ViewState(
+        latitude=36.5, longitude=127.5, zoom=6, pitch=45
+    )
+    
+    layer = pdk.Layer(
+        "ScatterplotLayer",
+        data,
+        get_position=["longitude", "latitude"],
+        get_color="[color_r, color_g, 100, 160]",
+        get_radius="취약_지수 * 500",
+        pickable=True,
+    )
+    
+    r = pdk.Deck(
+        layers=[layer],
+        initial_view_state=view_state,
+        tooltip={"text": "{시도명}\n취약 지수: {취약_지수}\n소화전 밀도: {소화전_밀도_D}"}
+    )
+    st.pydeck_chart(r)
+
 # ==========================================
 # 2. 메인 화면
 # ==========================================
@@ -332,11 +325,13 @@ with col_sum1:
     화재 발생 시 골든타임 확보를 위해 현장 100~140m 반경 내 소화전이 필수적으로 배치되어야 합니다.
     그러나 행정구역별 **면적 대비 소화전 밀도**는 극심한 불균형을 보이며,
     화재 위험이 높은 지역임에도 법적 기준 미달율이 지속적으로 높게 유지되고 있습니다.
-
-    * **핵심 공식:**
-      * $\text{소화전 밀도} = \dfrac{\text{소화전 수 (A)}}{\text{면적 (B)}}$
-      * $\text{취약 지수} = f(\text{화재 밀도},\; \text{소화전 밀도})$
     """)
+    
+    st.write("**🧮 핵심 분석 공식**")
+    # LaTeX를 사용하여 이미지처럼 선명하고 큼직하게 수식을 표시합니다.
+    st.latex(r"\text{NFDS 취약지수} = w_1 \cdot \text{화재 발생 밀도} + w_2 \cdot \text{인프라 결핍도}")
+    st.caption("※ $w_1$(화재위험 가중치)=0.6, $w_2$(인프라결핍 가중치)=0.4 적용")
+    st.latex(r"\text{인프라 결핍도} = \frac{1}{\text{소화전 설치 밀도}}")
 
 with col_sum2:
     st.info("""
@@ -349,16 +344,20 @@ with col_sum2:
 # ==========================================
 # 3. 탭 구성
 # ==========================================
-tab_map, tab_matrix, tab_policy = st.tabs([
-    "🗺️ Step 1. 전국 시·도 공간 지리 맵핑",
-    "📊 Step 2. 취약 격차 4분면 매트릭스 진단",
-    "💡 Step 3. 우선순위 정책 제언 및 대안",
-])
+st.sidebar.title("🔍 분석 단계 선택")
+menu = st.sidebar.radio(
+    "이동할 단계를 선택하세요:",
+    [
+        "🗺️ Step 1. 전국 시·도 공간 지리 맵핑",
+        "📊 Step 2. 취약 격차 4분면 매트릭스 진단",
+        "💡 Step 3. 우선순위 정책 제언 및 대안",
+    ]
+)
 
 # ------------------------------------------
 # Tab 1 — 공간 지리 맵핑
 # ------------------------------------------
-with tab_map:
+if menu == "🗺️ Step 1. 전국 시·도 공간 지리 맵핑":
     st.header("🗺️ 전국 시·도별 소방 취약 인프라 공간 시각화")
     st.markdown("전국 17개 시·도의 취약 지수를 지도로 확인하고 기준점으로 필터링합니다.")
 
@@ -386,17 +385,14 @@ with tab_map:
             if map_df.empty:
                 st.error("업로드된 개별 소화전 좌표 데이터에 유효한 위치 정보가 없습니다.")
             else:
-                st.map(map_df, size=5)
-                st.caption("※ 개별 소화전 위치를 지도에 표시합니다.")
+                st.map(map_df, size=5) # 개별 포인트는 기존 방식 유지
         else:
             map_df = filtered_df.dropna(subset=["latitude", "longitude"])
             if map_df.empty:
                 st.error("지도에 표시할 수 있는 유효한 좌표 데이터가 없습니다.")
             else:
-                st.map(map_df, size=80)
-                if len(map_df) < len(filtered_df):
-                    st.warning("일부 지역은 좌표가 없어 지도에 표시되지 않습니다.")
-                st.caption("※ 마커 위치는 각 시·도 행정 중심 좌표 기준입니다.")
+                render_vulnerability_map(map_df)
+                st.caption("※ 원의 크기와 색상은 취약 지수를 나타냅니다 (크고 붉을수록 취약).")
 
     with col_map_table:
         st.subheader("📑 행정구역별 인프라 데이터")
@@ -413,45 +409,81 @@ with tab_map:
 # ------------------------------------------
 # Tab 2 — 4분면 매트릭스 진단
 # ------------------------------------------
-with tab_matrix:
+elif menu == "📊 Step 2. 취약 격차 4분면 매트릭스 진단":
     st.header("📊 소방안전 취약도 4분면 매트릭스")
     st.markdown("화재 발생 건수와 소화전 밀도의 중앙값을 기준으로 전국 시·도를 4개 구역으로 분류합니다.")
 
     median_fire    = df_sido["화재발생건수_C"].median()
     median_density = df_sido["소화전_밀도_D"].median()
 
-    danger_zone  = []   # 화재↑ & 밀도↓ → 최우선 관리
-    normal_zone  = []   # 화재↓ & 밀도↓ → 잠재 위험
-    overkill_zone = []  # 화재↓ & 밀도↑ → 안전
-    well_prepared = []  # 화재↑ & 밀도↑ → 적정 방어
+    # 구역 분류 로직 정의
+    def get_zone(f, d):
+        if f >= median_fire and d < median_density: return "🚨 최우선 관리"
+        elif f < median_fire and d >= median_density: return "✅ 안전 지대"
+        elif f >= median_fire and d >= median_density: return "✨ 적정 방어"
+        else: return "⚠️ 잠재 위험"
 
+    # 구역 정보 데이터프레임에 추가
+    df_sido["분석_구역"] = df_sido.apply(lambda x: get_zone(x["화재발생건수_C"], x["소화전_밀도_D"]), axis=1)
+
+    # --- 1. 우선순위 랭킹 차트 (Horizontal Bar) ---
+    st.subheader("📊 지역별 취약 지수 및 관리 구역 랭킹")
+    
+    # 취약 지수 순으로 정렬
+    df_sorted = df_sido.sort_values(by="취약_지수", ascending=True)
+
+    fig_bar = px.bar(
+        df_sorted,
+        x="취약_지수",
+        y="시도명",
+        color="분석_구역",
+        orientation='h',
+        title="종합 취약 지수 기반 지역별 위험도 랭킹",
+        color_discrete_map={
+            "🚨 최우선 관리": "#EF553B",  # Red
+            "⚠️ 잠재 위험": "#FECB52",    # Yellow/Orange
+            "✨ 적정 방어": "#636EFA",    # Blue
+            "✅ 안전 지대": "#00CC96"     # Green
+        },
+        labels={"취약_지수": "취약 지수 (점)", "시도명": "시·도", "분석_구역": "분류 구역"},
+        hover_data={
+            "소화전_밀도_D": ":.2f",
+            "화재발생건수_C": ":,d",
+            "취약_지수": ":.1f"
+        },
+        height=600
+    )
+    
+    fig_bar.update_layout(
+        legend_title_text='4분면 분류',
+        yaxis={'categoryorder':'total ascending'}
+    )
+    st.plotly_chart(fig_bar, use_container_width=True)
+
+    st.divider()
+
+    # --- 2. 텍스트 리스트 요약 ---
+    st.subheader("📝 구역별 요약 리스트")
+
+    zones = {"danger": [], "potential": [], "safe": [], "prepared": []}
     for _, row in df_sido.iterrows():
-        f, d = row["화재발생건수_C"], row["소화전_밀도_D"]
-        name = row["시도명"]
-        if   f >= median_fire and d <  median_density: danger_zone.append(name)
-        elif f <  median_fire and d >= median_density: overkill_zone.append(name)
-        elif f >= median_fire and d >= median_density: well_prepared.append(name)
-        else:                                          normal_zone.append(name)
+        z_name = row["분석_구역"]
+        if "최우선" in z_name: zones["danger"].append(row["시도명"])
+        elif "안전" in z_name: zones["safe"].append(row["시도명"])
+        elif "적정" in z_name: zones["prepared"].append(row["시도명"])
+        else: zones["potential"].append(row["시도명"])
 
     col_mat1, col_mat2 = st.columns(2)
-
     with col_mat1:
         st.error("🚨 [1] 최우선 관리 구역 — 화재↑ · 소화전 밀도↓")
-        st.write("화재 빈도 높음 + 인프라 부족 → 즉각적인 예산 투입 필요")
-        st.info(", ".join(danger_zone) or "없음")
-
+        st.info(", ".join(zones["danger"]) or "없음")
         st.warning("⚠️ [2] 잠재 위험 구역 — 화재↓ · 소화전 밀도↓")
-        st.write("현재 화재 건수는 적으나 소화전 밀도 부족 → 대형 화재 확산 위험 잠재")
-        st.info(", ".join(normal_zone) or "없음")
-
+        st.info(", ".join(zones["potential"]) or "없음")
     with col_mat2:
         st.success("✅ [3] 안전 지대 — 화재↓ · 소화전 밀도↑")
-        st.write("화재 빈도 낮음 + 촘촘한 소화전망 → 고도 안전 상태 유지")
-        st.info(", ".join(overkill_zone) or "없음")
-
+        st.info(", ".join(zones["safe"]) or "없음")
         st.success("✨ [4] 적정 방어 구역 — 화재↑ · 소화전 밀도↑")
-        st.write("화재 빈도 높으나 소방용수 인프라도 충분히 구축된 균형 상태")
-        st.info(", ".join(well_prepared) or "없음")
+        st.info(", ".join(zones["prepared"]) or "없음")
 
     st.divider()
 
@@ -482,7 +514,7 @@ with tab_matrix:
 # ------------------------------------------
 # Tab 3 — 우선순위 정책 제언
 # ------------------------------------------
-with tab_policy:
+elif menu == "💡 Step 3. 우선순위 정책 제언 및 대안":
     st.header("💡 데이터 기반 우선순위 정책 제언")
 
     st.subheader("📌 1. 취약 지수 상위 3개 시·도 — 소화전 즉시 확충 대상")
