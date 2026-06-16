@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 import pydeck as pdk
 import plotly.express as px
-from PIL import Image
 try:
     import folium
     FOLIUM_AVAILABLE = True
@@ -13,6 +12,12 @@ except ModuleNotFoundError:
     FOLIUM_AVAILABLE = False
 import streamlit.components.v1 as components
 
+# folium 출력을 위한 helper (streamlit-folium이 없을 경우를 대비한 fallback)
+try:
+    from streamlit_folium import st_folium
+except ImportError:
+    st_folium = None
+
 # ==========================================
 # 0. 페이지 설정
 # ==========================================
@@ -20,40 +25,6 @@ st.set_page_config(
     page_title="전국 시·도 소방안전 취약도 및 소화전 인프라 최적화 시스템",
     page_icon="🚒",
     layout="wide"
-)
-
-st.markdown(
-    """
-    <style>
-    .streamlit-card {
-        background: #ffffff;
-        border: 1px solid #d9e2ec;
-        border-radius: 24px;
-        padding: 24px;
-        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
-        margin-bottom: 24px;
-    }
-    .streamlit-card .card-title {
-        font-size: 1.1rem;
-        font-weight: 700;
-        color: #0f3c78;
-        margin-bottom: 14px;
-    }
-    .streamlit-card ul {
-        margin: 0;
-        padding-left: 20px;
-        color: #22313f;
-    }
-    .streamlit-card li {
-        margin-bottom: 10px;
-    }
-    .streamlit-card .small-note {
-        color: #5c6c7c;
-        margin-top: 12px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
 )
 
 # ==========================================
@@ -226,7 +197,7 @@ def load_and_merge_new_data():
                     # 2. 시군구명 추출 (시도명/접두사 제거 후 첫 단어)
                     remaining = val[len(matched_prefix):].strip() if matched_prefix else val
                     parts = remaining.split()
-                    sigungu = parts[0] if parts else sido
+                    sigungu = parts[0] if parts and len(parts) > 0 else sido
                     return sido, sigungu
 
                 # 성능 최적화: pd.Series 대신 리스트 컴프리헨션 사용 (속도 향상)
@@ -325,7 +296,6 @@ if not skip_processing:
         df_sido["법적기준_미달율"] = (
             (df_sido["면적_B"] / df_sido["소화전개소_A"].replace(0, np.nan)) * 300 + 12
         ).fillna(89.2).clip(lower=8.5, upper=89.2).round(1)
-
 
 # 지도 표시를 위해 광역 단위 좌표를 부여합니다.
 province_coords = {
@@ -648,79 +618,61 @@ st.sidebar.markdown("**출처:** NFDS(국가화재정보시스템), KOSIS(국가
 # ------------------------------------------
 if menu == "1️⃣ Phase 1 | 핵심 분석 지표 도출":
     st.header("🗺️ Phase 1: 화재 취약도 지표 분석")
-
-    # 개요
+    
     st.subheader("📌 개요")
-    st.markdown("전국 광역시도별 화재·소화전 현황을 비교하여 초기 문제를 정의하고 우선 대응지역을 식별합니다.")
+    st.write("전국 광역/기초 자치단체별 화재 발생 현황과 소화전 인프라를 비교하여 화재 위험 지역을 식별합니다.")
 
-    # 목적
-    st.subheader("🎯 목적")
-    st.markdown(
-        "전국 광역시도별 화재·소화전 현황을 비교합니다.\n초기 문제를 정의하고 우선 대응지역을 식별합니다."
-    )
-
-    st.markdown(
-        """
-        <div class="streamlit-card">
-            <div class="card-title">핵심 공식</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.image("공식.png", width=860)
-    st.markdown(
-        """
-        <div style='background:#eff6ff;border:1px solid #c7dbff;border-radius:16px;padding:16px;margin-top:12px;'>
-            <div style='font-size:1.2rem;font-weight:700;color:#10316b;'>취약지수 = 0.6 × E + 0.4 × (1 / D)</div>
-            <div style='margin-top:10px;color:#32455f;'>E: 화재 발생 밀도 (건/km²) · D: 소화전 설치 밀도 (개/km²)</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.info("법적 근거: 소방시설 설치 기준(예시) — 소화전 권장 배치거리 140m 이내")
+    col_goal, col_problem = st.columns(2)
+    with col_goal:
+        st.subheader("🎯 목적")
+        st.markdown("- 취약 지역 조기 식별 및 자원 우선 배분 기준 정립\n- 데이터 기반의 객관적인 소방 행정 정책 수립 지원")
+    with col_problem:
+        st.subheader("🚩 문제정의")
+        st.write("인구 밀집 및 화재 다발 지역임에도 불구하고 소화전 등 기초 소방 시설이 부족한 '안전 사각지대'를 정량화합니다.")
 
     st.divider()
 
-    # 문제정의
-    st.subheader("🚩 문제정의")
-    st.markdown(
-        """
-        <div class="streamlit-card">
-            <div class="card-title">문제 정의</div>
-            <ul>
-                <li>화재 다발 지역이나 인구밀집 지역에서 소화전 부족</li>
-                <li>화재는 적지만 소화전이 부족한 지역의 예방 취약성</li>
-                <li>소화전은 많지만 화재가 발생하는 지역의 운영·접근성 문제</li>
-            </ul>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    # 핵심 공식 및 법적 근거 (컴팩트 배치)
+    st.subheader("🧮 핵심 지표 및 산출 근거")
+    
+    col_formula_imgs = st.columns(2)
+    with col_formula_imgs[0]:
+        # 취약지수 공식 이미지 추가 (크기 조절)
+        formula_img_path = "취약지수.png"
+        if os.path.exists(formula_img_path):
+            st.image(formula_img_path, caption="화재 취약 지수 산출 공식", width=600)
+    with col_formula_imgs[1]:
+        # 연구 배경 이미지 이동 및 크기 조절
+        image_files = [f for f in os.listdir('.') if f.lower().endswith(('.png', '.jpg', '.jpeg')) and f != "취약지수.png"]
+        if image_files:
+            st.image(image_files[0], caption="소방 방재 연구 배경 및 도메인 지식", width=550)
+
+    col_info_1, col_info_2 = st.columns(2)
+    with col_info_1:
+        st.markdown("**⚖️ 법적 근거**")
+        st.info("소방시설 설치 및 관리에 관한 법률 시행령 (소화전 설치 기준 및 거리 준수)")
+    with col_info_2:
+        st.markdown("**📚 데이터 출처**")
+        st.info("국가화재정보시스템(NFDS) 전문가 설문 및 가중치 분석 연구")
 
     st.divider()
 
-    # 데이터 분석 결과
-    st.subheader("📈 전국 상위 취약 지역 차트")
-
-    valid_scores = df_sido["취약_지수"].replace([np.inf, -np.inf], np.nan).dropna()
-    if valid_scores.empty:
-        st.error("유효한 취약 지수 데이터가 없어 분석을 진행할 수 없습니다.")
-        st.stop()
-
+    # 전국 소화전 분포 지도
+    st.subheader("📍 전국 소화전 분포 지도")
+    
+    valid_scores = df_sido["취약_지수"].dropna()
     score_cutoff = st.slider(
-        "필터링 기준 취약 지수 (높을수록 인프라 결핍 심각)",
+        "취약 지수 필터 (높을수록 위험)",
         min_value=float(valid_scores.min()),
         max_value=float(valid_scores.max()),
         value=float(valid_scores.min()),
         step=0.5,
     )
-
     filtered_df = df_sido[df_sido["취약_지수"] >= score_cutoff]
-
+    
     col_map_view, col_map_table = st.columns([3, 2])
 
     with col_map_view:
-        st.subheader("📍 취약 지역 공간 분포")
         if hydrant_points is not None:
             map_df = hydrant_points.dropna(subset=["latitude", "longitude"])
             if map_df.empty:
@@ -735,7 +687,7 @@ if menu == "1️⃣ Phase 1 | 핵심 분석 지표 도출":
                 render_vulnerability_map(map_df)
 
     with col_map_table:
-        st.subheader("📑 행정구역별 인프라 데이터")
+        st.markdown("**주요 지표 요약**")
         styled_df = (
             filtered_df[[
                 "시도명", "면적_B", "소화전개소_A",
@@ -750,46 +702,20 @@ if menu == "1️⃣ Phase 1 | 핵심 분석 지표 도출":
 # Tab 2 — 4분면 매트릭스 진단
 # ------------------------------------------
 elif menu == "2️⃣ Phase 2 | 시각화 기반 분석 심층화":
-    st.header("📊 Phase 2: 분석 및 결과")
-
-    # 분석
-    st.subheader("📊 분석")
-    st.markdown("Phase 1 지표를 활용한 지역별 비교·시각화(바 차트, 4분면 산점도 등)")
+    st.header("📊 Phase 2: 취약지수에 따른 데이터 분석")
+    
+    st.sidebar.subheader("📍 지역 필터")
+    selected_sidos = st.sidebar.multiselect(
+        "분석할 시도를 선택하세요", 
+        options=sorted(df_sido["시도명_full"].unique()),
+        default=sorted(df_sido["시도명_full"].unique())[:3]
+    )
+    
+    display_df = df_sido[df_sido["시도명_full"].isin(selected_sidos)]
 
     # (차트) 상위 취약 지역
-    top_phase1 = (
-        df_sido.groupby("시도명_full")[
-            ["화재_발생_밀도_E", "소화전_밀도_D", "취약_지수"]
-        ]
-        .mean()
-        .reset_index()
-        .sort_values("취약_지수", ascending=False)
-        .head(10)
-    )
-    fig_phase1 = px.bar(
-        top_phase1,
-        x="시도명_full",
-        y=["화재_발생_밀도_E", "소화전_밀도_D"],
-        barmode="group",
-        title="상위 취약 지역: 화재 발생 밀도 vs 소화전 밀도",
-        labels={
-            "화재_발생_밀도_E": "화재 발생 밀도 (건/km²)",
-            "소화전_밀도_D": "소화전 설치 밀도 (개/km²)",
-            "시도명_full": "시도명",
-        },
-        height=520,
-    )
-    st.plotly_chart(fig_phase1, use_container_width=True)
-
-    st.write("**분석결과:** 화재 발생↑ & 소화전↓ 지역 = 우선 개선 대상")
-
-    # 4분면 분석
-    df_sido["화재대비_소화전비율"] = (
-        df_sido["화재발생건수_C"] / df_sido["소화전개소_A"].replace(0, np.nan)
-    ).replace([np.inf, -np.inf], np.nan).round(4)
-
-    median_fire = df_sido["화재발생건수_C"].median()
-    median_density = df_sido["소화전_밀도_D"].median()
+    median_fire = display_df["화재발생건수_C"].median()
+    median_density = display_df["소화전_밀도_D"].median()
 
     def get_zone(f, d):
         if f >= median_fire and d < median_density:
@@ -797,27 +723,25 @@ elif menu == "2️⃣ Phase 2 | 시각화 기반 분석 심층화":
         elif f < median_fire and d >= median_density:
             return "✅ 안전 지대"
         elif f >= median_fire and d >= median_density:
-            return "✨ 적정 방어"
+            return "📊 관리 요망"
         else:
-            return "⚠️ 잠재 위험"
+            return "⚠️ 예방 강화"
 
-    df_sido["분석_구역"] = df_sido.apply(
-        lambda x: get_zone(x["화재발생건수_C"], x["소화전_밀도_D"]), axis=1
-    )
+    display_df["분석_구역"] = display_df.apply(lambda x: get_zone(x["화재발생건수_C"], x["소화전_밀도_D"]), axis=1)
 
+    st.subheader("📈 화재 빈도 vs 소화전 밀도 (4분면 매트릭스)")
     fig_quad = px.scatter(
-        df_sido,
-        x="화재발생건수_C",
+        display_df, x="화재발생건수_C",
         y="소화전_밀도_D",
         color="분석_구역",
         size="취약_지수",
         hover_name="시도명",
         title="4분면 분석: 화재 건수 vs 소화전 밀도",
         color_discrete_map={
-            "🚨 최우선 관리": "#EF553B",
-            "⚠️ 잠재 위험": "#FECB52",
-            "✨ 적정 방어": "#636EFA",
-            "✅ 안전 지대": "#00CC96",
+            "🚨 최우선 관리": "#D62728",
+            "⚠️ 예방 강화": "#FF7F0E",
+            "📊 관리 요망": "#1F77B4",
+            "✅ 안전 지대": "#2CA02C",
         },
         labels={
             "화재발생건수_C": "연간 화재 건수",
@@ -827,156 +751,95 @@ elif menu == "2️⃣ Phase 2 | 시각화 기반 분석 심층화":
         },
         height=620,
     )
-    fig_quad.add_shape(
-        type="line",
-        x0=median_fire,
-        x1=median_fire,
-        y0=0,
-        y1=df_sido["소화전_밀도_D"].max() * 1.05,
-        line=dict(color="gray", dash="dash"),
-    )
-    fig_quad.add_shape(
-        type="line",
-        x0=0,
-        x1=df_sido["화재발생건수_C"].max() * 1.05,
-        y0=median_density,
-        y1=median_density,
-        line=dict(color="gray", dash="dash"),
-    )
-    fig_quad.update_layout(
-        legend_title_text="분류",
-        xaxis_title="연간 화재 건수",
-        yaxis_title="소화전 밀도 (개/km²)",
-    )
     st.plotly_chart(fig_quad, use_container_width=True)
 
-    # 도출된 결과
-    st.write("**도출된 결과:**")
-    st.markdown("- 우선 개선 대상(🚨): 화재다발·소화전 부족 지역\n- 유지관리 대상(✨/✅): 소화전 수준 양호, 운영·접근성 점검 필요")
-
-    # 지역별 상세 현황
-    grouped = (
-        df_sido.groupby("시도명_full")[
-            ["면적_B", "소화전개소_A", "소화전_밀도_D", "화재발생건수_C", "취약_지수"]
-        ]
-        .agg({
-            "면적_B": "sum",
-            "소화전개소_A": "sum",
-            "소화전_밀도_D": "mean",
-            "화재발생건수_C": "sum",
-            "취약_지수": "mean",
-        })
-        .reset_index()
-        .sort_values(by="취약_지수", ascending=False)
-    )
-    st.dataframe(grouped.rename(columns={"시도명_full": "지역"}), use_container_width=True)
-
-    # 예방 관점 분석
-    st.subheader("🔎 예방 관점 분석")
-    low_fire_low_hydrant = df_sido[(df_sido["화재발생건수_C"] < median_fire) & (df_sido["소화전_밀도_D"] < median_density)]
-    st.markdown("**예방 필요 지역:** 화재는 적지만 소화전 밀도 낮은 지역 (우선 점검·교육 대상)")
-    st.dataframe(low_fire_low_hydrant[["시도명", "화재발생건수_C", "소화전_밀도_D", "취약_지수"]].head(10), use_container_width=True)
+    # 데이터 분석 결과 텍스트 요약
+    st.subheader("💡 데이터 분석 결과 요약")
+    highest_v = display_df.loc[display_df["취약_지수"].idxmax()]
+    lowest_v = display_df.loc[display_df["취약_지수"].idxmin()]
+    
+    analysis_text = f"""
+    - **전체 요약:** 선택된 {len(selected_sidos)}개 시도 중 **{highest_v['시도명']}**이(가) 취약 지수 {highest_v['취약_지수']:.2f}로 가장 위험도가 높은 것으로 분석되었습니다.
+    - **최우선 관리 대상:** 화재 빈도가 중위값({median_fire:.0f}건) 이상이면서 소화전 밀도가 중위값({median_density:.2f}개/km²) 이하인 지역은 집중 관리가 필요합니다.
+    - **인프라 결핍:** 취약 지수가 높은 지역은 주로 화재 발생 밀도가 급증함에도 불구하고 소화전 확충 속도가 따라가지 못하는 경향을 보입니다.
+    """
+    st.info(analysis_text)
 
 # ------------------------------------------
 # Tab 3 — 우선순위 정책 제언
 # ------------------------------------------
 elif menu == "3️⃣ Phase 3 | 해결 전략 & 우선순위 제언":
-    st.header("💡 Phase 3: 우선순위 지역 식별 및 정책 제언")
+    st.header("💡 Phase 3: 데이터 기반 결론 및 정책 제언")
+    
+    st.subheader("🎯 출동 우선순위 및 내비게이션 전략")
+    st.write("2페이지의 분석 결과에 따라 화재 위험 밀도가 높고 인프라가 부족한 '🚨 최우선 관리' 지역을 1순위 출동 및 순찰 지역으로 설정합니다.")
 
-    # 개요
-    st.subheader("📌 개요")
-    st.markdown("Phase 2 결과를 바탕으로 우선 등급을 부여하고 정책적 우선순위를 제시합니다.")
+    # 내비게이션 시도 및 시군구 상세 필터
+    col_nav_sel1, col_nav_sel2 = st.columns(2)
+    with col_nav_sel1:
+        nav_sido_val = st.selectbox("시/도 선택", options=sorted(df_sido["시도명_full"].unique()))
+    with col_nav_sel2:
+        # 선택된 시도에 해당하는 시군구 목록 추출
+        available_sigungu = sorted(df_sido[df_sido["시도명_full"] == nav_sido_val]["시도명"].unique())
+        nav_sigungu_val = st.multiselect("상세 시/군/구 선택 (미선택 시 전체)", options=available_sigungu)
 
-    # 목적
-    st.subheader("🎯 목적")
-    st.markdown("""
-    - 취약지수 기반 우선등급(A/B) 설정
-    - 취약지역(상위) 간단 설명 및 정책 권고
-    """)
-
-    # 데이터 분석 방법
-    st.subheader("📊 분석 방법")
-    st.markdown("""
-    **우선 등급 기준:**
-    - A 등급: 취약지수 상위 30% (우선 투자 및 보강)
-    - B 등급: 그 외(정기 점검·유지)
-    **분류 기준:** 취약지수 및 화재 발생 빈도 기반
-    """)
-
-    st.divider()
-
-    # 도출된 분석 결과
-    st.subheader("📈 도출된 분석 결과")
-
-    # 우선 등급 분류
-    percentile_70 = df_sido["취약_지수"].quantile(0.7)
-    df_sido["출동_우선등급"] = df_sido["취약_지수"].apply(
-        lambda x: "A (핵심)" if x >= percentile_70 else "B (일반)"
-    )
-
-    st.write("**우선순위 지역 분류:**")
-    st.dataframe(
-        df_sido[["시도명", "출동_우선등급", "취약_지수", "화재_발생_밀도_E", "소화전_밀도_D"]]
-        .sort_values(["출동_우선등급", "취약_지수"], ascending=[True, False])
-        .reset_index(drop=True),
-        width="stretch",
-    )
-
-    st.divider()
-
-    # 상위 3개 지역 강조 + 간단 설명
-    st.write("**🏆 취약도 상위 3개 지역:**")
-    top3 = df_sido.sort_values(by="취약_지수", ascending=False).head(3)
-
-    col_t1, col_t2, col_t3 = st.columns(3)
-    for idx, (_, row) in enumerate(top3.iterrows()):
-        with [col_t1, col_t2, col_t3][idx]:
-            st.error(f"{idx+1}위: {row['시도명']}")
-            st.metric("취약지수", f"{row['취약_지수']:.2f}")
-            st.write(
-                f"- 화재: {row['화재발생건수_C']}건 ({row['화재_발생_밀도_E']:.2f}건/km²)\n"
-                f"- 소화전: {row['소화전개소_A']}개 ({row['소화전_밀도_D']:.2f}개/km²)"
-            )
-            st.markdown("*간단 설명:* 취약지수 상위 지역은 화재 빈도와 소화전 밀도 불균형으로 단기 보강 우선 필요")
-
-    st.divider()
-
-    # 취약지수 기반 지도
-    st.write("**취약지수 기반 지도**")
-    mean_vuln = df_sido["취약_지수"].mean()
-    df_above = df_sido[df_sido["취약_지수"] > mean_vuln]
-    st.info(f"선정 기준: 취약지수 > {mean_vuln:.2f} (전국 평균) | 대상: {len(df_above)}개 지역)")
-    if not df_above.empty:
-        render_vulnerability_map(df_above)
+    if nav_sigungu_val:
+        nav_filtered_df = navigation_df[navigation_df["시도명"].isin(nav_sigungu_val)]
+        display_name = f"{nav_sido_val} ({len(nav_sigungu_val)}개 지역)"
     else:
-        st.info("평균보다 높은 취약 지역이 없습니다.")
+        nav_filtered_df = navigation_df[navigation_df["시도명"].str.contains(nav_sido_val)]
+        display_name = nav_sido_val
+    
+    route_map, mean_v, route_df = build_fire_patrol_route(nav_filtered_df)
+
+    col_nav, col_detail = st.columns([3, 2])
+    with col_nav:
+        st.markdown(f"**🚒 {display_name} 순찰 최적화 경로**")
+        if route_map is not None:
+            if st_folium:
+                st_folium(route_map, width=700, height=450)
+            else:
+                st.warning("folium이 설치되지 않았습니다.")
+        else:
+            st.info("해당 지역에 대한 경로 데이터가 부족합니다.")
+
+        if not route_df.empty:
+            st.markdown("**📋 상세 순찰 지점 리스트 (시/군/구 단위)**")
+            # 시군구 분류를 명확히 보여주기 위해 데이터프레임 출력
+            st.dataframe(route_df[["시도명", "취약_지수", "nearest_hydrant_km"]].rename(columns={"시도명": "지역(시군구)"}), use_container_width=True)
+
+    with col_detail:
+        st.markdown("**📌 우선순위 활용 방향**")
+        st.markdown("""
+        1. **내비게이션 연동:** 소방차 출동 시 취약 지수가 높은 구역을 경유하거나 피하는 최적 경로 안내에 활용.
+        2. **스마트 순찰:** 화재 취약 지수가 높은 시간대에 해당 경로를 중심으로 예방 순찰 강화.
+        3. **실시간 관제:** 소방 상황실에서 지점별 취약 지수를 실시간으로 확인하여 자원 배분 결정.
+        """)
 
     st.divider()
 
-    # 개선 방향 및 대안 (A/B 등급 중심)
-    st.subheader("🛡️ 개선 방향 및 대안")
+    # 개선 방향 및 대안
+    st.subheader("🛡️ 개선 방향 및 정책 제언")
     col_strat_a, col_strat_b = st.columns(2)
     with col_strat_a:
-        st.markdown("""
-        **A 등급 (핵심 지역)**
-        - 기준: 취약지수 상위 30%
-        - 조치: 소화전 신규 설치·우선 투자, 현장 접근성 개선, 집중 예방교육
+        st.markdown("#### [단기] 인프라 보강 및 대응")
+        st.error("""
+        - **급수차 우선 진입로 확보:** 소화전 밀도가 낮은 지역은 용수 공급이 어려우므로 대형 급수차 전용 진입로 우선 설정.
+        - **추가 소화전 집중 설치:** 법적 기준 미달율이 높은 **{display_name}** 내 고위험 구역에 예산 우선 투입.
+        - **비상 소화장치 보급:** 소방차 진입 곤란 지역(전통시장, 노후 주거지)에 주민 자율 소화장치 설치 확대.
         """)
     with col_strat_b:
-        st.markdown("""
-        **B 등급 (일반 지역)**
-        - 기준: 취약지수 하위 70%
-        - 조치: 정기 점검·유지관리, 노후 소화전 교체, 지역별 예방 캠페인
+        st.markdown("#### [장기] 예방 행정 및 정책")
+        st.success(f"""
+        - **지자체 협력(시청/도청):** 도시 개발 계획 단계에서 화재 취약 지수를 반영한 '소방 안전성 검토' 의무화 제안.
+        - **소방안전지도 고도화:** 본 데이터를 시청 관제 센터와 공유하여 지역별 맞춤형 소방 행정 서비스 제공.
+        - **법적 기준 강화:** 화재 발생 밀도가 높은 지역에 대해 소화전 설치 간격을 법적 기준보다 강화하여 적용.
         """)
 
     st.divider()
-
-    # 데이터 활용 관점 (명확화)
-    st.subheader("📌 데이터 활용 관점")
-    st.markdown("""
-    - **운영 최적화:** 실시간 경보·우선 출동 목록 생성, 정기 순찰 스케줄링
-    - **투자 계획:** 취약지수 기반 인프라 투자 우선순위 산정(예산 근거)
-    - **예방 전략:** 예방교육·캠페인 대상 선별, 취약세대 집중점검
-    - **정책 개선:** 소화전 배치거리·기준 재검토, 법적 기준 보완 제안
-    - **기술 보완:** IoT 센서·원격 감시로 초기경보 체계 연계
+    st.subheader("💡 결론")
+    st.markdown(f"""
+    본 분석을 통해 **{display_name}** 지역의 실질적인 인프라 결핍과 화재 취약성을 확인하였습니다. 
+    단순히 소화전을 늘리는 것을 넘어, **데이터 기반의 우선순위 설정**과 **내비게이션을 활용한 전략적 대응**이 결합될 때 
+    지역 사회의 화재 안전망이 비로소 완성될 수 있습니다.
     """)
