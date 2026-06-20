@@ -137,7 +137,7 @@ def load_and_merge_new_data():
         df_fire = pd.read_csv('화재발생.csv', encoding='utf-8-sig')
         df_hydrants_raw = pd.read_csv('소화전.csv', encoding='utf-8-sig') if os.path.exists('소화전.csv') else None
         
-        # 2. 행정구역 데이터 전처리 (시·도 + 시·군·구 계층 구조 처리)
+        # 2. 행정구역 데이터 전처리 (시·도 단위로 집계)
         df_area.columns = [c.replace('\ufeff', '') for c in df_area.columns]
         df_area.rename(columns={'소재지(시군구)별': '지역명_raw', '2025': '면적_B'}, inplace=True)
 
@@ -145,25 +145,23 @@ def load_and_merge_new_data():
                  "세종특별자치시", "경기도", "강원특별자치도", "충청북도", "충청남도", "전북특별자치도", 
                  "전라남도", "경상북도", "경상남도", "제주특별자치도"]
         
-        # 면적 데이터에서 시도-시군구 관계 생성
+        # 면적 데이터를 시도별로 집계
         area_list = []
         curr_sido = None
         for _, row in df_area.iterrows():
             name = str(row['지역명_raw']).strip()
             if name in sidos:
                 curr_sido = name
-                if name == "세종특별자치시": # 세종시는 시도이자 시군구
-                    area_list.append({'시도명': curr_sido, '시군구명': curr_sido, '면적_B': row['면적_B']})
-            elif curr_sido:
-                area_list.append({'시도명': curr_sido, '시군구명': name, '면적_B': row['면적_B']})
+                area_list.append({'시도명': curr_sido, '면적_B': row['면적_B']})
         df_area_processed = pd.DataFrame(area_list)
 
-        # 화재 데이터 전처리
+        # 화재 데이터 전처리 (시도별로 집계)
         df_fire.rename(columns={'행정구역별(1)': '시도명', '행정구역별(2)': '시군구명', '2025': '화재발생건수_C'}, inplace=True)
-        df_fire = df_fire[df_fire['시군구명'] != '소계'].copy()
-        df_fire['시군구명'] = df_fire['시군구명'].replace('세종시', '세종특별자치시')
+        # 소계 행만 사용하여 시도별 합계 가져오기
+        df_fire_sido = df_fire[df_fire['시군구명'] == '소계'].copy()
+        df_fire_sido = df_fire_sido[['시도명', '화재발생건수_C']].copy()
         
-        # 3. 소화전 데이터 집계 (주소 분석을 통한 시군구 단위 카운트)
+        # 3. 소화전 데이터 집계 (주소 분석을 통한 시도 단위 카운트)
         if df_hydrants_raw is not None:
             addr_cols = ['시도명', '시도', '지역', '주소', 'location', '소재지', '설치위치', '설치장소', '도로명주소', '지번주소', '소재지도로명주소', '설치장소']
             target_col = next((c for c in addr_cols if c in df_hydrants_raw.columns), None)
@@ -176,10 +174,10 @@ def load_and_merge_new_data():
                     "전북": "전북특별자치도", "전남": "전라남도", "경북": "경상북도", "경남": "경상남도", "제주": "제주특별자치도"
                 }
                 def parse_addr(val):
-                    if not isinstance(val, str) or not val.strip(): return "기타", "기타"
+                    if not isinstance(val, str) or not val.strip(): return "기타"
                     val = val.strip()
                     
-                    # 1. 시도명 찾기 (긴 명칭 우선 매칭으로 정확도 향상)
+                    # 시도명 찾기 (긴 명칭 우선 매칭으로 정확도 향상)
                     sido = "기타"
                     matched_prefix = ""
                     for s in sidos:
@@ -193,34 +191,28 @@ def load_and_merge_new_data():
                                 sido = full
                                 matched_prefix = short
                                 break
-                    
-                    # 2. 시군구명 추출 (시도명/접두사 제거 후 첫 단어)
-                    remaining = val[len(matched_prefix):].strip() if matched_prefix else val
-                    parts = remaining.split()
-                    sigungu = parts[0] if parts and len(parts) > 0 else sido
-                    return sido, sigungu
+                    return sido
 
-                # 성능 최적화: pd.Series 대신 리스트 컴프리헨션 사용 (속도 향상)
+                # 성능 최적화: 시도별로만 파싱
                 parsed_results = df_hydrants_raw[target_col].apply(parse_addr)
-                df_hydrants_raw['시도명_std'] = [res[0] for res in parsed_results]
-                df_hydrants_raw['시군구명_std'] = [res[1] for res in parsed_results]
-                df_h_count = df_hydrants_raw.groupby(['시도명_std', '시군구명_std']).size().reset_index(name='소화전개소_A')
+                df_hydrants_raw['시도명_std'] = parsed_results
+                df_h_count = df_hydrants_raw.groupby('시도명_std').size().reset_index(name='소화전개소_A')
                 
-                # 위경도 데이터가 있다면 시군구별 평균 좌표 계산
+                # 위경도 데이터가 있다면 시도별 평균 좌표 계산
                 hydrants_mapped = normalize_coord_columns(df_hydrants_raw)
                 if 'latitude' in hydrants_mapped.columns and 'longitude' in hydrants_mapped.columns:
-                    coords_agg = hydrants_mapped.groupby(['시도명_std', '시군구명_std'])[['latitude', 'longitude']].mean().reset_index()
-                    df_h_count = pd.merge(df_h_count, coords_agg, on=['시도명_std', '시군구명_std'], how='left')
+                    coords_agg = hydrants_mapped.groupby('시도명_std')[['latitude', 'longitude']].mean().reset_index()
+                    df_h_count = pd.merge(df_h_count, coords_agg, on='시도명_std', how='left')
                 
-                df_h_count.rename(columns={'시도명_std': '시도명', '시군구명_std': '시군구명'}, inplace=True)
+                df_h_count.rename(columns={'시도명_std': '시도명'}, inplace=True)
             else:
                 df_h_count = pd.DataFrame(columns=['시도명', '소화전개소_A'])
         else:
-            df_h_count = pd.DataFrame(columns=['시도명', '시군구명', '소화전개소_A'])
+            df_h_count = pd.DataFrame(columns=['시도명', '소화전개소_A'])
 
-        # 4. 데이터 병합 (시도명 + 시군구명 기준)
-        merged = pd.merge(df_area_processed, df_fire, on=['시도명', '시군구명'], how='inner')
-        merged = pd.merge(merged, df_h_count, on=['시도명', '시군구명'], how='left')
+        # 4. 데이터 병합 (시도명 기준)
+        merged = pd.merge(df_area_processed, df_fire_sido, on='시도명', how='inner')
+        merged = pd.merge(merged, df_h_count, on='시도명', how='left')
         
         # 데이터 매칭 확인을 위한 알림
         zero_count = merged['소화전개소_A'].isna().sum()
@@ -231,7 +223,6 @@ def load_and_merge_new_data():
         
         # 표시용 지역명 생성
         merged['시도명_full'] = merged['시도명']
-        merged['시도명'] = merged['시도명'] + " " + merged['시군구명']
         
         return merged, df_hydrants_raw
     except Exception as e:
@@ -443,6 +434,7 @@ def compute_nearest_hydrant_info(df_regions: pd.DataFrame, hydrants: pd.DataFram
         closest_idx = int(np.argmin(distances))
         rows.append({
             "시도명": region["시도명"],
+            "시도명_full": region.get("시도명_full", region["시도명"]),
             "latitude": target_lat,
             "longitude": target_lon,
             "취약_지수": region.get("취약_지수", np.nan),
@@ -774,39 +766,55 @@ elif menu == "3️⃣ Phase 3 | 해결 전략 & 우선순위 제언":
     st.subheader("🎯 출동 우선순위 및 내비게이션 전략")
     st.write("2페이지의 분석 결과에 따라 화재 위험 밀도가 높고 인프라가 부족한 '🚨 최우선 관리' 지역을 1순위 출동 및 순찰 지역으로 설정합니다.")
 
-    # 내비게이션 시도 및 시군구 상세 필터
-    col_nav_sel1, col_nav_sel2 = st.columns(2)
-    with col_nav_sel1:
-        nav_sido_val = st.selectbox("시/도 선택", options=sorted(df_sido["시도명_full"].unique()))
-    with col_nav_sel2:
-        # 선택된 시도에 해당하는 시군구 목록 추출
-        available_sigungu = sorted(df_sido[df_sido["시도명_full"] == nav_sido_val]["시도명"].unique())
-        nav_sigungu_val = st.multiselect("상세 시/군/구 선택 (미선택 시 전체)", options=available_sigungu)
-
-    if nav_sigungu_val:
-        nav_filtered_df = navigation_df[navigation_df["시도명"].isin(nav_sigungu_val)]
-        display_name = f"{nav_sido_val} ({len(nav_sigungu_val)}개 지역)"
-    else:
-        nav_filtered_df = navigation_df[navigation_df["시도명"].str.contains(nav_sido_val)]
-        display_name = nav_sido_val
+    # 내비게이션 시도 선택
+    nav_sido_val = st.selectbox("시/도 선택", options=sorted(df_sido["시도명_full"].unique()))
+    nav_filtered_df = navigation_df[navigation_df["시도명_full"] == nav_sido_val]
+    display_name = nav_sido_val
+    
+    # navigation_df가 비어있으면 df_sido에서 직접 필터링하여 사용
+    if nav_filtered_df.empty and not df_sido[df_sido["시도명_full"] == nav_sido_val].empty:
+        st.caption("ℹ️ 개별 소화전 좌표 데이터가 없어 시도 단위 데이터로 경로를 생성합니다.")
+        # df_sido에서 필요한 컬럼만 추출하여 navigation_df 형태로 변환
+        nav_filtered_df = df_sido[df_sido["시도명_full"] == nav_sido_val].copy()
+        # 필요한 컬럼들이 있는지 확인하고 없으면 추가
+        if "nearest_hydrant_km" not in nav_filtered_df.columns:
+            nav_filtered_df["nearest_hydrant_km"] = 0.0
+        if "출동_우선등급" not in nav_filtered_df.columns:
+            nav_filtered_df["출동_우선등급"] = ""
+    
+    # 디버깅 정보 표시
+    with st.expander("🔍 디버깅 정보"):
+        st.write(f"선택된 시도: {nav_sido_val}")
+        st.write(f"navigation_df 전체 크기: {len(navigation_df)}")
+        st.write(f"필터링된 데이터 크기: {len(nav_filtered_df)}")
+        if not nav_filtered_df.empty:
+            st.write("필터링된 데이터 컬럼:", nav_filtered_df.columns.tolist())
+            st.dataframe(nav_filtered_df[["시도명", "취약_지수", "nearest_hydrant_km", "latitude", "longitude"]])
     
     route_map, mean_v, route_df = build_fire_patrol_route(nav_filtered_df)
 
     col_nav, col_detail = st.columns([3, 2])
     with col_nav:
         st.markdown(f"**🚒 {display_name} 순찰 최적화 경로**")
+        
+        # 디버깅: 경로 정보 표시
+        if not route_df.empty:
+            st.caption(f"평균 취약 지수: {mean_v:.2f} | 선정된 경로 지점: {len(route_df)}개")
+        
         if route_map is not None:
             if st_folium:
                 st_folium(route_map, width=700, height=450)
             else:
                 st.warning("folium이 설치되지 않았습니다.")
         else:
-            st.info("해당 지역에 대한 경로 데이터가 부족합니다.")
+            if nav_filtered_df.empty:
+                st.warning(f"⚠️ '{nav_sido_val}'에 대한 네비게이션 데이터가 없습니다. navigation_df가 비어있습니다.")
+            else:
+                st.info("해당 지역에 대한 경로 데이터가 부족합니다. 취약 지수가 평균 이하이거나 좌표 정보가 없을 수 있습니다.")
 
         if not route_df.empty:
-            st.markdown("**📋 상세 순찰 지점 리스트 (시/군/구 단위)**")
-            # 시군구 분류를 명확히 보여주기 위해 데이터프레임 출력
-            st.dataframe(route_df[["시도명", "취약_지수", "nearest_hydrant_km"]].rename(columns={"시도명": "지역(시군구)"}), use_container_width=True)
+            st.markdown("**📋 상세 순찰 지점 리스트**")
+            st.dataframe(route_df[["시도명", "취약_지수", "nearest_hydrant_km"]], use_container_width=True)
 
     with col_detail:
         st.markdown("**📌 우선순위 활용 방향**")
