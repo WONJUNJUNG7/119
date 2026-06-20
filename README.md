@@ -1,19 +1,23 @@
-# 🎈 Blank app template
+# 전국 소방 취약도 분석 & 출동 네비게이션 제안
 
-A simple Streamlit app template for you to modify!
+## 실행 방법
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://blank-app-template.streamlit.app/)
+### 방법 1: 더블클릭으로 실행 (권장)
+1. `start_streamlit.bat` 파일을 **더블클릭**하세요
+2. 자동으로 필요한 패키지가 설치되고 브라우저가 열립니다
 
-### How to run it on your own machine
+### 방법 2: PowerShell에서 실행
+PowerShell을 사용하는 경우:
+```powershell
+.\start_streamlit.bat
+```
 
-1. Install the requirements
+### 방법 3: CMD에서 실행
+CMD를 사용하는 경우:
+```cmd
+start_streamlit.bat
+```
 
-   ```
-   $ pip install -r requirements.txt
-   ```
-
-2. Run the app
-
-   ```
-   $ streamlit run streamlit_app.py
-   ```
+## 주의사항
+- PowerShell에서 실행할 때는 `.\`를 앞에 붙여야 합니다 (예: `.\start_streamlit.bat`)
+- 파일 탐색기에서 더블클릭하는 것이 가장 간단합니다
