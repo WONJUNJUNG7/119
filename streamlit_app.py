@@ -92,6 +92,8 @@ def load_sido_hydrant_data():
         (df["면적_B"] / df["소화전개소_A"].replace(0, np.nan)) * 300 + 12
     ).fillna(89.2).clip(lower=8.5, upper=89.2).round(1) 
 
+    df["시도명_full"] = df["시도명"]
+
     return df
 
 
@@ -453,7 +455,10 @@ def compute_nearest_hydrant_info(df_regions: pd.DataFrame, hydrants: pd.DataFram
 def convert_numeric_route_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["취약_지수"] = pd.to_numeric(df["취약_지수"], errors="coerce")
-    df["nearest_hydrant_km"] = pd.to_numeric(df["nearest_hydrant_km"], errors="coerce")
+    if "nearest_hydrant_km" not in df.columns:
+        df["nearest_hydrant_km"] = np.nan
+    else:
+        df["nearest_hydrant_km"] = pd.to_numeric(df["nearest_hydrant_km"], errors="coerce")
     return df
 
 
@@ -563,6 +568,275 @@ def build_fire_patrol_route(df: pd.DataFrame):
     folium.PolyLine(path, color="red", weight=5, opacity=0.8).add_to(route_map)
     return route_map, mean_vuln, route_df
 
+
+def build_phase3_route_map(route_points_df: pd.DataFrame):
+    if not FOLIUM_AVAILABLE:
+        return None, route_points_df
+
+    route_points_df = route_points_df.copy()
+    route_points_df = convert_numeric_route_columns(route_points_df)
+
+    path = []
+    for _, row in route_points_df.iterrows():
+        lat = row.get("latitude")
+        lon = row.get("longitude")
+        if pd.isna(lat) or pd.isna(lon):
+            lat = row.get("nearest_hydrant_lat")
+            lon = row.get("nearest_hydrant_lon")
+
+        if pd.isna(lat) or pd.isna(lon):
+            coords = get_region_coordinates(str(row.get("시도명", "")))
+            if coords is not None:
+                lat, lon = coords
+
+        if pd.isna(lat) or pd.isna(lon):
+            continue
+
+        path.append((float(lat), float(lon)))
+
+    if not path:
+        return None, route_points_df
+
+    route_map = folium.Map(location=path[0], zoom_start=7)
+    for idx, (lat, lon) in enumerate(path, start=1):
+        folium.map.Marker(
+            [lat, lon],
+            icon=folium.DivIcon(
+                html=f"""
+                    <div style=\"width:32px;height:32px;border-radius:50%;background:#d62728;color:white;font-weight:bold;text-align:center;line-height:32px;border:2px solid white;box-shadow:0 0 4px rgba(0,0,0,0.25);\">{idx}</div>
+                """
+            ),
+        ).add_to(route_map)
+
+    folium.PolyLine(path, color="red", weight=4, opacity=0.8).add_to(route_map)
+    return route_map, route_points_df
+
+
+# ---------------------------------------------------------------------------
+# 시도 내 시군구 단위 집계 및 순찰 경로 생성
+# ---------------------------------------------------------------------------
+
+# 시군구별 대표 좌표 (주요 경기도 시군구 포함 전국)
+_SIGUNGU_COORDS = {
+    # 경기도
+    "수원시": (37.2636, 127.0286), "성남시": (37.4449, 127.1388), "의정부시": (37.7382, 127.0337),
+    "안양시": (37.3943, 126.9568), "부천시": (37.5034, 126.7660), "광명시": (37.4784, 126.8644),
+    "평택시": (36.9921, 127.1128), "동두천시": (37.9037, 127.0607), "안산시": (37.3236, 126.8219),
+    "고양시": (37.6584, 126.8320), "과천시": (37.4292, 126.9879), "구리시": (37.5942, 127.1296),
+    "남양주시": (37.6360, 127.2162), "오산시": (37.1498, 127.0775), "시흥시": (37.3800, 126.8029),
+    "군포시": (37.3614, 126.9350), "의왕시": (37.3448, 126.9688), "하남시": (37.5395, 127.2147),
+    "용인시": (37.2411, 127.1776), "파주시": (37.7600, 126.7797), "이천시": (37.2792, 127.4428),
+    "안성시": (37.0078, 127.2797), "김포시": (37.6154, 126.7157), "화성시": (37.1994, 126.8313),
+    "광주시": (37.4296, 127.2553), "양주시": (37.7854, 127.0459), "포천시": (37.8947, 127.2003),
+    "여주시": (37.2983, 127.6375), "연천군": (38.0961, 127.0749), "가평군": (37.8316, 127.5112),
+    "양평군": (37.4916, 127.4875),
+    # 서울
+    "종로구": (37.5730, 126.9794), "중구": (37.5638, 126.9976), "용산구": (37.5326, 126.9903),
+    "성동구": (37.5636, 127.0364), "광진구": (37.5388, 127.0824), "동대문구": (37.5744, 127.0396),
+    "중랑구": (37.6065, 127.0927), "성북구": (37.5894, 127.0167), "강북구": (37.6396, 127.0255),
+    "도봉구": (37.6688, 127.0471), "노원구": (37.6543, 127.0568), "은평구": (37.6176, 126.9227),
+    "서대문구": (37.5791, 126.9368), "마포구": (37.5638, 126.9084), "양천구": (37.5170, 126.8665),
+    "강서구": (37.5509, 126.8496), "구로구": (37.4954, 126.8876), "금천구": (37.4569, 126.8955),
+    "영등포구": (37.5263, 126.8963), "동작구": (37.5124, 126.9393), "관악구": (37.4784, 126.9516),
+    "서초구": (37.4837, 127.0325), "강남구": (37.5172, 127.0474), "송파구": (37.5145, 127.1059),
+    "강동구": (37.5301, 127.1238),
+    # 부산
+    "중구": (35.1032, 129.0326), "서구": (35.0987, 129.0253), "동구": (35.1358, 129.0589),
+    "영도구": (35.0876, 129.0680), "부산진구": (35.1636, 129.0531), "동래구": (35.2057, 129.0842),
+    "남구": (35.1361, 129.0843), "북구": (35.2031, 128.9909), "해운대구": (35.1631, 129.1635),
+    "사하구": (35.1041, 128.9741), "금정구": (35.2430, 129.0900), "강서구": (35.2112, 128.9801),
+    "연제구": (35.1766, 129.0802), "수영구": (35.1456, 129.1134), "사상구": (35.1498, 128.9924),
+    "기장군": (35.2445, 129.2218),
+}
+
+
+@st.cache_data
+def build_sigungu_route_for_sido(sido_name: str, hydrant_raw_df):
+    """
+    선택된 시도(sido_name) 내의 시/군/구 단위로 소화전 데이터를 집계하여
+    취약도 기반 순찰 경로 DataFrame을 반환합니다.
+    """
+    if hydrant_raw_df is None or hydrant_raw_df.empty:
+        return pd.DataFrame()
+
+    addr_col = hydrant_raw_df.columns[0]  # 첫 번째 컬럼 = 도로명주소
+    lat_col = next((c for c in hydrant_raw_df.columns if str(c).lower() in {"latitude","lat","위도"}), None)
+    lon_col = next((c for c in hydrant_raw_df.columns if str(c).lower() in {"longitude","lon","lng","경도"}), None)
+
+    # 시도 접두어로 필터링 (예: "경기" → "경기도 ..." 행)
+    sido_prefix = sido_name[:2]
+    mask = hydrant_raw_df[addr_col].astype(str).str.startswith(sido_prefix)
+    sido_df = hydrant_raw_df[mask].copy()
+
+    if sido_df.empty:
+        return pd.DataFrame()
+
+    # 알려진 시군구 명칭 목록 (오타·공백 누락 정제에 사용)
+    _KNOWN_SIGUNGU = [
+        # 경기도
+        "수원시","성남시","의정부시","안양시","부천시","광명시","평택시","동두천시","안산시",
+        "고양시","과천시","구리시","남양주시","오산시","시흥시","군포시","의왕시","하남시",
+        "용인시","파주시","이천시","안성시","김포시","화성시","광주시","양주시","포천시",
+        "여주시","연천군","가평군","양평군",
+        # 서울
+        "종로구","중구","용산구","성동구","광진구","동대문구","중랑구","성북구","강북구",
+        "도봉구","노원구","은평구","서대문구","마포구","양천구","강서구","구로구","금천구",
+        "영등포구","동작구","관악구","서초구","강남구","송파구","강동구",
+        # 부산
+        "영도구","부산진구","동래구","해운대구","사하구","금정구","연제구","수영구","사상구","기장군",
+        # 그 외 주요 시군구
+        "남구","북구","동구","서구","달서구","수성구","달성군","중구",
+        "계양구","부평구","남동구","연수구","미추홀구","서구","강화군","옹진군",
+        "완산구","덕진구","익산시","군산시","정읍시","남원시","김제시",
+        "순천시","목포시","여수시","나주시","광양시",
+        "포항시","경주시","김천시","안동시","구미시","영주시","영천시","상주시","문경시","경산시",
+        "창원시","진주시","통영시","사천시","김해시","밀양시","거제시","양산시",
+        "제주시","서귀포시",
+        "천안시","공주시","보령시","아산시","서산시","논산시","계룡시","당진시",
+        "청주시","충주시","제천시",
+        "춘천시","원주시","강릉시","동해시","태백시","속초시","삼척시",
+        "세종시",
+    ]
+
+    def extract_sigungu(addr):
+        """주소에서 시군구를 추출하되, 오타·공백 누락 등을 정제합니다."""
+        if not isinstance(addr, str):
+            return "기타"
+        addr = addr.strip()
+        parts = addr.split()
+        if len(parts) < 2:
+            return "기타"
+
+        raw_token = parts[1]  # 두 번째 토큰 (정상이면 시군구명)
+
+        # ① 정상 케이스: 끝이 시/군/구로 끝나는 경우
+        if raw_token.endswith(("시", "군", "구")):
+            # 오타 교정 (예: 냠양주시 → 남양주시)
+            for known in _KNOWN_SIGUNGU:
+                if raw_token == known:
+                    return known
+                # 2글자 이상 일치하는 알려진 이름으로 교정
+                if len(raw_token) >= 3 and len(known) >= 3:
+                    if raw_token[-1] == known[-1] and sum(a == b for a, b in zip(raw_token, known)) >= len(known) - 1:
+                        return known
+            return raw_token  # 교정 불가시 원본 반환
+
+        # ② 공백 누락 케이스: 두 번째 토큰이 "시흥시경기도과기대로"처럼 붙어 있는 경우
+        for known in _KNOWN_SIGUNGU:
+            if raw_token.startswith(known):
+                return known
+
+        return raw_token
+
+    sido_df["시군구"] = sido_df[addr_col].apply(extract_sigungu)
+
+    # 시군구별 소화전 수 집계
+    count_df = sido_df.groupby("시군구").size().reset_index(name="소화전수")
+
+    # 시군구별 평균 좌표 집계 (CSV에 좌표가 있으면)
+    if lat_col and lon_col:
+        sido_df[lat_col] = pd.to_numeric(sido_df[lat_col], errors="coerce")
+        sido_df[lon_col] = pd.to_numeric(sido_df[lon_col], errors="coerce")
+        coords_df = sido_df.dropna(subset=[lat_col, lon_col]).groupby("시군구")[[lat_col, lon_col]].mean().reset_index()
+        coords_df.rename(columns={lat_col: "latitude", lon_col: "longitude"}, inplace=True)
+        count_df = pd.merge(count_df, coords_df, on="시군구", how="left")
+    else:
+        count_df["latitude"] = None
+        count_df["longitude"] = None
+
+    # 좌표가 없는 시군구는 _SIGUNGU_COORDS에서 보완
+    for i, row in count_df.iterrows():
+        if pd.isna(row.get("latitude")) or pd.isna(row.get("longitude")):
+            sg = row["시군구"]
+            fallback = next(
+                (v for k, v in _SIGUNGU_COORDS.items() if sg.startswith(k[:2]) or k.startswith(sg[:2])),
+                None,
+            )
+            if fallback:
+                count_df.at[i, "latitude"] = fallback[0]
+                count_df.at[i, "longitude"] = fallback[1]
+
+    count_df = count_df.dropna(subset=["latitude", "longitude"]).copy()
+
+    # 취약 지수 = 소화전 수의 역수 기반 (Phase 1 방식과 통일)
+    # 소화전이 적을수록 취약도가 높으며, 역수 min-max 정규화로 0~49.9 범위 유지
+    if count_df.empty:
+        return pd.DataFrame()
+
+    inv = (1.0 / count_df["소화전수"].replace(0, np.nan)).fillna(0)
+    inv_min, inv_max = inv.min(), inv.max()
+    if inv_max > inv_min:
+        count_df["취약_지수"] = ((inv - inv_min) / (inv_max - inv_min) * 49.9).round(2)
+    else:
+        count_df["취약_지수"] = 25.0
+    count_df["시도명"] = sido_name
+    count_df["시도명_full"] = sido_name + " " + count_df["시군구"]
+    count_df["소화전_밀도_D"] = count_df["소화전수"]
+
+    return count_df.sort_values(by="취약_지수", ascending=False).reset_index(drop=True)
+
+
+def build_sigungu_folium_map(sigungu_df: pd.DataFrame, sido_name: str, top_n: int = 10):
+    """시군구 단위 순찰 경로 Folium 지도를 생성합니다."""
+    if not FOLIUM_AVAILABLE or sigungu_df.empty:
+        return None, sigungu_df
+
+    route_df = sigungu_df.head(top_n).copy()
+
+    path = []
+    for _, row in route_df.iterrows():
+        lat = row.get("latitude")
+        lon = row.get("longitude")
+        if pd.isna(lat) or pd.isna(lon):
+            continue
+        path.append((float(lat), float(lon)))
+
+    if not path:
+        return None, route_df
+
+    center_lat = sum(p[0] for p in path) / len(path)
+    center_lon = sum(p[1] for p in path) / len(path)
+
+    route_map = folium.Map(location=[center_lat, center_lon], zoom_start=9)
+
+    color_map = {1: "red", 2: "orange", 3: "orange"}
+    for idx, (lat, lon) in enumerate(path, start=1):
+        row = route_df.iloc[idx - 1]
+        sg_name = row.get("시군구", "")
+        vuln = row.get("취약_지수", 0)
+        cnt = int(row.get("소화전수", 0))
+        color = color_map.get(idx, "blue")
+        popup_html = (
+            f"<strong>{idx}순위: {sg_name}</strong><br>"
+            f"취약 지수: {vuln:.1f}<br>"
+            f"소화전 수: {cnt}개"
+        )
+        folium.Marker(
+            location=[lat, lon],
+            popup=folium.Popup(popup_html, max_width=280),
+            tooltip=f"{idx}. {sg_name} (소화전 {cnt}개)",
+            icon=folium.Icon(color=color, icon="fire" if idx == 1 else "info-sign", prefix="glyphicon"),
+        ).add_to(route_map)
+
+    if len(path) > 1:
+        folium.PolyLine(path, color="red", weight=4, opacity=0.8, dash_array="8").add_to(route_map)
+
+    # 범례 추가
+    legend_html = """
+    <div style="position:fixed;bottom:30px;left:30px;z-index:1000;background:white;
+                padding:12px 16px;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.2);
+                font-size:13px;line-height:1.8;">
+        <b>🚒 순찰 우선순위</b><br>
+        <span style="color:#d62728;">●</span> 1순위 (최고 취약)<br>
+        <span style="color:#ff7f0e;">●</span> 2~3순위<br>
+        <span style="color:#1f77b4;">●</span> 4순위 이하<br>
+        <span style="color:#e00;">——</span> 순찰 경로
+    </div>
+    """
+    route_map.get_root().html.add_child(folium.Element(legend_html))
+
+    return route_map, route_df
+
 # 출동 우선등급(Top20%) 및 네비게이션 후보 계산
 #  - 출동_우선등급: 취약지수 상위 20% -> A, 나머지 -> B
 threshold_80 = df_sido["취약_지수"].quantile(0.8)
@@ -645,7 +919,7 @@ if menu == "1️⃣ Phase 1 | 핵심 분석 지표 도출":
         st.info("소방시설 설치 및 관리에 관한 법률 시행령 (소화전 설치 기준 및 거리 준수)")
     with col_info_2:
         st.markdown("**📚 데이터 출처**")
-        st.info("국가화재정보시스템(NFDS) 전문가 설문 및 가중치 분석 연구\n\n[MDPI 논문 참고](https://www.mdpi.com/2571-6255/6/3/107)")
+        st.info("국가화재정보시스템(NFDS) 전문가 설문 및 가중치 분석 연구")
 
     st.divider()
 
@@ -696,196 +970,15 @@ if menu == "1️⃣ Phase 1 | 핵심 분석 지표 도출":
 elif menu == "2️⃣ Phase 2 | 시각화 기반 분석 심층화":
     st.header("📊 Phase 2: 취약지수에 따른 데이터 분석")
     
-    # 분석 레벨 선택 (시/도 or 시/군/구)
-    st.sidebar.subheader("📊 분석 레벨 선택")
-    analysis_level = st.sidebar.radio(
-        "분석 단위를 선택하세요",
-        ["시/도 단위", "시/군/구 단위"]
+    st.sidebar.subheader("📍 지역 필터")
+    selected_sidos = st.sidebar.multiselect(
+        "분석할 시도를 선택하세요", 
+        options=sorted(df_sido["시도명_full"].unique()),
+        default=sorted(df_sido["시도명_full"].unique())[:3]
     )
     
-    if analysis_level == "시/도 단위":
-        st.sidebar.subheader("📍 지역 필터")
-        selected_sidos = st.sidebar.multiselect(
-            "분석할 시도를 선택하세요", 
-            options=sorted(df_sido["시도명_full"].unique()),
-            default=sorted(df_sido["시도명_full"].unique())[:3]
-        )
-        display_df = df_sido[df_sido["시도명_full"].isin(selected_sidos)]
-    else:
-        # 시/군/구 단위 분석
-        st.sidebar.subheader("📍 시/도 선택")
-        selected_sido_for_gu = st.sidebar.selectbox(
-            "분석할 시도를 선택하세요",
-            options=sorted(df_sido["시도명_full"].unique())
-        )
-        
-        # 시/군/구 데이터 로드 (최종 수정 버전)
-        @st.cache_data
-        def load_sigungu_data():
-            """시/군/구 단위 데이터 로드 및 처리"""
-            try:
-                # 화재 데이터 로드 - 헤더 없이 읽고 직접 컬럼명 지정
-                df_fire_raw = pd.read_csv('화재발생.csv', encoding='utf-8-sig', header=None)
-                # 첫 번째 행이 헤더인지 확인
-                if '행정구역' in str(df_fire_raw.iloc[0, 0]):
-                    df_fire_raw = df_fire_raw.iloc[1:].reset_index(drop=True)
-                
-                # 새 DataFrame 생성 (컬럼명 명시적 지정)
-                df_fire = pd.DataFrame()
-                df_fire['시도명'] = df_fire_raw.iloc[:, 0].astype(str)
-                df_fire['시군구명'] = df_fire_raw.iloc[:, 1].astype(str)
-                df_fire['화재발생건수_C'] = pd.to_numeric(df_fire_raw.iloc[:, 2], errors='coerce')
-                df_fire = df_fire[df_fire['시군구명'] != '소계'].copy()
-                
-                # 면적 데이터 로드 - 헤더 없이 읽고 직접 컬럼명 지정
-                df_area_raw = pd.read_csv('전국면적.csv', encoding='utf-8-sig', header=None)
-                # 첫 번째 행이 헤더인지 확인
-                if '소재지' in str(df_area_raw.iloc[0, 0]):
-                    df_area_raw = df_area_raw.iloc[1:].reset_index(drop=True)
-                
-                # 새 DataFrame 생성
-                df_area = pd.DataFrame()
-                df_area['지역명'] = df_area_raw.iloc[:, 0].astype(str)
-                df_area['면적_B'] = pd.to_numeric(df_area_raw.iloc[:, 1], errors='coerce')
-                
-                # 시도명 추출 함수
-                sidos = df_sido["시도명_full"].unique().tolist()
-                def extract_sido(name):
-                    for sido in sidos:
-                        if name.startswith(sido):
-                            return sido
-                    return None
-                
-                df_area['시도명'] = df_area['지역명'].apply(extract_sido)
-                df_area['시군구명'] = df_area['지역명']
-                df_area = df_area[df_area['시도명'].notna()].copy()
-                
-                # 전체 지역명 생성
-                df_fire['전체지역명'] = df_fire['시도명'] + ' ' + df_fire['시군구명']
-                
-                # 데이터 병합
-                merged = pd.merge(
-                    df_fire[['시도명', '시군구명', '전체지역명', '화재발생건수_C']],
-                    df_area[['시도명', '시군구명', '면적_B']],
-                    on=['시도명', '시군구명'],
-                    how='inner'
-                )
-                
-                # 소화전 데이터 추가
-                if os.path.exists('소화전.csv'):
-                    df_hydrants = pd.read_csv('소화전.csv', encoding='utf-8-sig')
-                    if '소재지도로명주소' in df_hydrants.columns:
-                        def extract_sigungu(addr):
-                            if not isinstance(addr, str):
-                                return None
-                            parts = addr.split()
-                            return ' '.join(parts[:3]) if len(parts) >= 3 else None
-                        
-                        df_hydrants['전체지역명'] = df_hydrants['소재지도로명주소'].apply(extract_sigungu)
-                        hydrant_counts = df_hydrants.groupby('전체지역명').size().reset_index(name='소화전개소_A')
-                        merged = pd.merge(merged, hydrant_counts, on='전체지역명', how='left')
-                    else:
-                        merged['소화전개소_A'] = 0
-                else:
-                    merged['소화전개소_A'] = 0
-                
-                merged['소화전개소_A'] = merged['소화전개소_A'].fillna(0)
-                
-                # 지표 계산
-                merged['소화전_밀도_D'] = (merged['소화전개소_A'] / merged['면적_B']).round(2)
-                merged['화재_발생_밀도_E'] = (merged['화재발생건수_C'] / merged['면적_B']).round(3)
-                merged['취약_지수'] = (
-                    (merged['화재_발생_밀도_E'] * 0.6) + 
-                    ((1 / merged['소화전_밀도_D'].replace(0, np.nan)).fillna(0) * 0.4)
-                ).round(2)
-                merged['법적기준_미달율'] = (
-                    (merged['면적_B'] / merged['소화전개소_A'].replace(0, np.nan)) * 300 + 12
-                ).fillna(89.2).clip(lower=8.5, upper=89.2).round(1)
-                
-                # 좌표 추가 (서울시 구만)
-                sgg_coords = {
-                    "종로구": (37.5735, 126.9786), "중구": (37.5641, 126.9970), "용산구": (37.5326, 126.9907),
-                    "성동구": (37.5505, 127.0408), "광진구": (37.5384, 127.0843), "동대문구": (37.5744, 127.0396),
-                    "중랑구": (37.6063, 127.0932), "성북구": (37.5894, 127.0167), "강북구": (37.6396, 127.0257),
-                    "도봉구": (37.6688, 127.0471), "노원구": (37.6542, 127.0568), "은평구": (37.6176, 126.9227),
-                    "서대문구": (37.5815, 126.9357), "마포구": (37.5663, 126.9014), "양천구": (37.5170, 126.8664),
-                    "강서구": (37.5509, 126.8495), "구로구": (37.4955, 126.8877), "금천구": (37.4606, 126.9006),
-                    "영등포구": (37.5264, 126.8962), "동작구": (37.5124, 126.9393), "관악구": (37.4783, 126.9416),
-                    "서초구": (37.4837, 127.0324), "강남구": (37.5172, 127.0473), "송파구": (37.5145, 127.1066),
-                    "강동구": (37.5302, 127.1238),
-                }
-                merged['위도'] = merged['시군구명'].map(lambda x: sgg_coords.get(x, (None, None))[0])
-                merged['경도'] = merged['시군구명'].map(lambda x: sgg_coords.get(x, (None, None))[1])
-                
-                return merged
-            except Exception as e:
-                st.error(f"데이터 로드 오류: {e}")
-                return pd.DataFrame()
-        
-        df_sigungu = load_sigungu_data()
-        
-        if not df_sigungu.empty:
-            # 컬럼명 확인 및 디버깅
-            # st.write("df_sigungu columns:", df_sigungu.columns.tolist())
-            
-            # 선택된 시도의 시/군/구 데이터만 필터링
-            display_df = df_sigungu[df_sigungu['시도명'] == selected_sido_for_gu].copy()
-            display_df['시도명_full'] = display_df['전체지역명']
-            
-            # 필수 컬럼 확인 및 대체
-            if '화재발생건수_C' not in display_df.columns:
-                # 디버깅 정보 표시
-                st.error(f"필수 컬럼 '화재발생건수_C'가 없습니다. 현재 컬럼: {display_df.columns.tolist()}")
-                # 수치 컬럼 찾아서 이름 변경
-                numeric_cols = display_df.select_dtypes(include=[np.number]).columns.tolist()
-                if len(numeric_cols) > 0:
-                    display_df = display_df.rename(columns={numeric_cols[0]: '화재발생건수_C'})
-                    st.warning(f"'{numeric_cols[0]}' 컬럼을 '화재발생건수_C'로 변경했습니다.")
-                else:
-                    display_df = pd.DataFrame()
-                    st.error("수치 데이터를 찾을 수 없습니다.")
-        else:
-            display_df = pd.DataFrame()
-            st.warning("시/군/구 데이터를 불러올 수 없습니다.")
+    display_df = df_sido[df_sido["시도명_full"].isin(selected_sidos)]
 
-    # 데이터가 비어있으면 메시지 표시
-    if display_df.empty:
-        st.warning("표시할 데이터가 없습니다. 시/군/구 데이터 로드에 실패했을 수 있습니다.")
-        st.stop()
-    
-    # 필수 컬럼 확인 및 최종 수정
-    if '화재발생건수_C' not in display_df.columns:
-        st.error("화재발생건수_C 컬럼이 최종적으로 없습니다. 데이터 구조를 확인합니다.")
-        st.write("현재 컬럼:", display_df.columns.tolist())
-        # 마지막 시도: 수치 컬럼을 찾아서 이름 변경
-        numeric_cols = display_df.select_dtypes(include=[np.number]).columns.tolist()
-        if len(numeric_cols) > 0:
-            display_df['화재발생건수_C'] = display_df[numeric_cols[0]]
-            st.warning(f"'{numeric_cols[0]}'을(를) '화재발생건수_C'로 사용합니다.")
-        else:
-            st.error("수치 데이터를 찾을 수 없습니다.")
-            st.stop()
-    
-    # 다른 필수 컬럼들도 확인
-    if '소화전_밀도_D' not in display_df.columns:
-        display_df['소화전_밀도_D'] = 0.0
-    if '취약_지수' not in display_df.columns:
-        display_df['취약_지수'] = 50.0
-    
-    # 화재발생건수_C 컬럼 최종 확인 및 강제 생성
-    if '화재발생건수_C' not in display_df.columns:
-        st.error("치명적 오류: 화재발생건수_C 컬럼이 없습니다.")
-        st.write("현재 컬럼 목록:", display_df.columns.tolist())
-        st.write("데이터 타입:", display_df.dtypes)
-        # 마지막 시도: 모든 수치 컬럼을 찾아서 사용
-        numeric_cols = display_df.select_dtypes(include=[np.number]).columns.tolist()
-        if len(numeric_cols) > 0:
-            st.warning(f"'{numeric_cols[0]}' 컬럼을 화재발생건수_C로 강제 지정합니다.")
-            display_df['화재발생건수_C'] = display_df[numeric_cols[0]]
-        else:
-            st.error("사용 가능한 수치 컬럼이 없습니다. 데이터를 확인하세요.")
-            st.stop()
-    
     # (차트) 상위 취약 지역
     median_fire = display_df["화재발생건수_C"].median()
     median_density = display_df["소화전_밀도_D"].median()
@@ -931,18 +1024,11 @@ elif menu == "2️⃣ Phase 2 | 시각화 기반 분석 심층화":
     highest_v = display_df.loc[display_df["취약_지수"].idxmax()]
     lowest_v = display_df.loc[display_df["취약_지수"].idxmin()]
     
-    if analysis_level == "시/도 단위":
-        analysis_text = f"""
-        - **전체 요약:** 선택된 {len(selected_sidos)}개 시도 중 **{highest_v['시도명']}**이(가) 취약 지수 {highest_v['취약_지수']:.2f}로 가장 위험도가 높은 것으로 분석되었습니다.
-        - **최우선 관리 대상:** 화재 빈도가 중위값({median_fire:.0f}건) 이상이면서 소화전 밀도가 중위값({median_density:.2f}개/km²) 이하인 지역은 집중 관리가 필요합니다.
-        - **인프라 결핍:** 취약 지수가 높은 지역은 주로 화재 발생 밀도가 급증함에도 불구하고 소화전 확충 속도가 따라가지 못하는 경향을 보입니다.
-        """
-    else:
-        analysis_text = f"""
-        - **전체 요약:** **{selected_sido_for_gu}**의 {len(display_df)}개 시/군/구 중 **{highest_v['시군구명']}**이(가) 취약 지수 {highest_v['취약_지수']:.2f}로 가장 위험도가 높은 것으로 분석되었습니다.
-        - **최우선 관리 대상:** 화재 빈도가 중위값({median_fire:.0f}건) 이상이면서 소화전 밀도가 중위값({median_density:.2f}개/km²) 이하인 지역은 집중 관리가 필요합니다.
-        - **인프라 결핍:** 취약 지수가 높은 지역은 주로 화재 발생 밀도가 급증함에도 불구하고 소화전 확충 속도가 따라가지 못하는 경향을 보입니다.
-        """
+    analysis_text = f"""
+    - **전체 요약:** 선택된 {len(selected_sidos)}개 시도 중 **{highest_v['시도명']}**이(가) 취약 지수 {highest_v['취약_지수']:.2f}로 가장 위험도가 높은 것으로 분석되었습니다.
+    - **최우선 관리 대상:** 화재 빈도가 중위값({median_fire:.0f}건) 이상이면서 소화전 밀도가 중위값({median_density:.2f}개/km²) 이하인 지역은 집중 관리가 필요합니다.
+    - **인프라 결핍:** 취약 지수가 높은 지역은 주로 화재 발생 밀도가 급증함에도 불구하고 소화전 확충 속도가 따라가지 못하는 경향을 보입니다.
+    """
     st.info(analysis_text)
 
 # ------------------------------------------
@@ -950,67 +1036,108 @@ elif menu == "2️⃣ Phase 2 | 시각화 기반 분석 심층화":
 # ------------------------------------------
 elif menu == "3️⃣ Phase 3 | 해결 전략 & 우선순위 제언":
     st.header("💡 Phase 3: 데이터 기반 결론 및 정책 제언")
-    
-    st.subheader("🎯 출동 우선순위 및 내비게이션 전략")
-    st.write("2페이지의 분석 결과에 따라 화재 위험 밀도가 높고 인프라가 부족한 '🚨 최우선 관리' 지역을 1순위 출동 및 순찰 지역으로 설정합니다.")
+    st.subheader("🎯 지역별 시/군/구 순찰 내비게이션 전략")
+    st.write("시/도를 선택하면 해당 지역 내 시/군/구별 소화전 데이터를 분석하여 최적 순찰 경로를 제안합니다.")
 
-    # 내비게이션 시도 선택
-    nav_sido_val = st.selectbox("시/도 선택", options=sorted(df_sido["시도명_full"].unique()))
-    nav_filtered_df = navigation_df[navigation_df["시도명_full"] == nav_sido_val]
+    # ── 지역 선택 UI ──────────────────────────────────────────
+    sido_options = sorted(df_sido["시도명_full"].unique())
+    col_sel1, col_sel2 = st.columns([2, 3])
+    with col_sel1:
+        nav_sido_val = st.selectbox(
+            "🗺️ 순찰 지역 선택 (시/도)",
+            options=sido_options,
+            index=sido_options.index("경기도") if "경기도" in sido_options else 0,
+            help="선택한 시/도 내의 시군구 단위로 순찰 내비게이션이 생성됩니다."
+        )
+    with col_sel2:
+        top_n_routes = st.slider(
+            "🔢 순찰 경유지 수 (상위 N개 시군구)",
+            min_value=3, max_value=15, value=7, step=1,
+            help="소화전이 부족한 상위 N개 시군구를 경유하는 경로를 생성합니다."
+        )
     display_name = nav_sido_val
-    
-    # navigation_df가 비어있으면 df_sido에서 직접 필터링하여 사용
-    if nav_filtered_df.empty and not df_sido[df_sido["시도명_full"] == nav_sido_val].empty:
-        st.caption("ℹ️ 개별 소화전 좌표 데이터가 없어 시도 단위 데이터로 경로를 생성합니다.")
-        # df_sido에서 필요한 컬럼만 추출하여 navigation_df 형태로 변환
-        nav_filtered_df = df_sido[df_sido["시도명_full"] == nav_sido_val].copy()
-        # 필요한 컬럼들이 있는지 확인하고 없으면 추가
-        if "nearest_hydrant_km" not in nav_filtered_df.columns:
-            nav_filtered_df["nearest_hydrant_km"] = 0.0
-        if "출동_우선등급" not in nav_filtered_df.columns:
-            nav_filtered_df["출동_우선등급"] = ""
-    
-    # 디버깅 정보 표시
-    with st.expander("🔍 디버깅 정보"):
-        st.write(f"선택된 시도: {nav_sido_val}")
-        st.write(f"navigation_df 전체 크기: {len(navigation_df)}")
-        st.write(f"필터링된 데이터 크기: {len(nav_filtered_df)}")
-        if not nav_filtered_df.empty:
-            st.write("필터링된 데이터 컬럼:", nav_filtered_df.columns.tolist())
-            st.dataframe(nav_filtered_df[["시도명", "취약_지수", "nearest_hydrant_km", "latitude", "longitude"]])
-    
-    route_map, mean_v, route_df = build_fire_patrol_route(nav_filtered_df)
+
+    st.markdown("<style>\n"
+                ".phase3-step {padding:14px;border-radius:10px;margin-bottom:10px;box-shadow:0 2px 8px rgba(0,0,0,0.08);}\n"
+                ".phase3-step.rank1 {border-left:5px solid #d62728;background:#fff5f5;}\n"
+                ".phase3-step.rank2 {border-left:5px solid #ff7f0e;background:#fff7ed;}\n"
+                ".phase3-step.rank3 {border-left:5px solid #ff7f0e;background:#fff7ed;}\n"
+                ".phase3-step.rankN {border-left:5px solid #1f77b4;background:#edf6ff;}\n"
+                ".phase3-step.rankLast {border-left:5px solid #2ca02c;background:#effaf1;}\n"
+                ".phase3-step-title {font-size:1rem;font-weight:700;margin-bottom:4px;}\n"
+                ".phase3-step-sub {font-size:0.94rem;color:#333;}\n"
+                "</style>", unsafe_allow_html=True)
+
+    # ── 시군구 단위 데이터 집계 ────────────────────────────────
+    hydrant_raw_for_route = hydrant_points_raw if 'hydrant_points_raw' in dir() else None
+    sigungu_df = build_sigungu_route_for_sido(nav_sido_val, hydrant_raw_for_route)
 
     col_nav, col_detail = st.columns([3, 2])
-    with col_nav:
-        st.markdown(f"**🚒 {display_name} 순찰 최적화 경로**")
-        
-        # 디버깅: 경로 정보 표시
-        if not route_df.empty:
-            st.caption(f"평균 취약 지수: {mean_v:.2f} | 선정된 경로 지점: {len(route_df)}개")
-        
-        if route_map is not None:
-            if st_folium:
-                st_folium(route_map, width=700, height=450)
-            else:
-                st.warning("folium이 설치되지 않았습니다.")
-        else:
-            if nav_filtered_df.empty:
-                st.warning(f"⚠️ '{nav_sido_val}'에 대한 네비게이션 데이터가 없습니다. navigation_df가 비어있습니다.")
-            else:
-                st.info("해당 지역에 대한 경로 데이터가 부족합니다. 취약 지수가 평균 이하이거나 좌표 정보가 없을 수 있습니다.")
 
-        if not route_df.empty:
-            st.markdown("**📋 상세 순찰 지점 리스트**")
-            st.dataframe(route_df[["시도명", "취약_지수", "nearest_hydrant_km"]], use_container_width=True)
+    with col_nav:
+        st.markdown(f"**🚒 {display_name} 내 시/군/구 순찰 경로 (소화전 부족 상위 {top_n_routes}개)**")
+
+        if not sigungu_df.empty:
+            route_map_sg, route_top_df = build_sigungu_folium_map(sigungu_df, nav_sido_val, top_n=top_n_routes)
+            if route_map_sg is not None:
+                if st_folium:
+                    st_folium(route_map_sg, width=750, height=520)
+                else:
+                    # streamlit-folium 미설치 시 HTML 렌더링으로 대체
+                    map_html = route_map_sg._repr_html_()
+                    components.html(map_html, height=520, scrolling=False)
+            else:
+                st.warning("경로 지도를 생성할 수 없습니다. 소화전 데이터를 확인해 주세요.")
+        else:
+            # 소화전 개별 좌표 없음 → 시도 단위 기본 경로로 fallback
+            st.info(f"📌 {nav_sido_val}의 개별 소화전 좌표 데이터가 없어 시도 단위 경로로 표시합니다.")
+            route_candidates = df_sido.sort_values(by="취약_지수", ascending=False).reset_index(drop=True)
+            phase3_route_df = route_candidates.head(top_n_routes)
+            route_map_fb, phase3_route_df = build_phase3_route_map(phase3_route_df)
+            if route_map_fb is not None:
+                if st_folium:
+                    st_folium(route_map_fb, width=750, height=520)
+                else:
+                    components.html(route_map_fb._repr_html_(), height=520, scrolling=False)
+            else:
+                st.warning("지도를 표시할 수 없습니다.")
+            route_top_df = phase3_route_df
 
     with col_detail:
-        st.markdown("**📌 우선순위 활용 방향**")
-        st.markdown("""
-        1. **내비게이션 연동:** 소방차 출동 시 취약 지수가 높은 구역을 경유하거나 피하는 최적 경로 안내에 활용.
-        2. **스마트 순찰:** 화재 취약 지수가 높은 시간대에 해당 경로를 중심으로 예방 순찰 강화.
-        3. **실시간 관제:** 소방 상황실에서 지점별 취약 지수를 실시간으로 확인하여 자원 배분 결정.
-        """)
+        st.markdown("**🧭 단계별 순찰 경로 가이드**")
+
+        if not sigungu_df.empty:
+            guide_df = sigungu_df.head(top_n_routes).reset_index(drop=True)
+            total = len(guide_df)
+            for idx, row in guide_df.iterrows():
+                rank = idx + 1
+                sg_name = row.get("시군구", row.get("시도명_full", ""))
+                vuln = row.get("취약_지수", 0)
+                cnt = int(row.get("소화전수", row.get("소화전개소_A", 0)))
+                if rank == 1:
+                    label, css, icon = "[1순위 / 출발점]", "rank1", "🚒"
+                elif rank == total:
+                    label, css, icon = f"[{rank}순위 / 도착점]", "rankLast", "🏁"
+                elif rank <= 3:
+                    label, css, icon = f"[{rank}순위 / 경유지]", "rank2", "🔴"
+                else:
+                    label, css, icon = f"[{rank}순위 / 경유지]", "rankN", "📍"
+
+                st.markdown(
+                    f"<div class='phase3-step {css}'>"
+                    f"<div class='phase3-step-title'>{icon} {label} {sg_name}</div>"
+                    f"<div class='phase3-step-sub'>"
+                    f"취약 지수: <b>{vuln:.1f}</b> | 소화전 수: <b>{cnt}개</b>"
+                    f"</div></div>",
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.info("시군구 단위 데이터가 없습니다.")
+
+        st.markdown("**📌 순찰 경로 활용 방향**")
+        st.markdown("1. **소화전 부족 지역 우선 점검:** 소화전 수가 적은 시군구는 화재 시 대응 능력이 낮으므로 순찰을 집중합니다.")
+        st.markdown("2. **경유지 중심 자원 배치:** 순찰 경로 상 경유지에 예비 소방차·급수차를 대기 배치하여 신속 대응합니다.")
+        st.markdown("3. **실시간 관제 연동:** 소방 상황실에서 해당 지역 취약 시군구를 상시 모니터링합니다.")
 
     st.divider()
 
