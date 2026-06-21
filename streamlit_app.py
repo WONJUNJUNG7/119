@@ -19,7 +19,7 @@ except ImportError:
     st_folium = None
 
 # ==========================================
-# 0. 페이지 설정 및 라이브러리 설치 안내
+# 0. 페이지 설정
 # ==========================================
 st.set_page_config(
     page_title="전국 시·도 소방안전 취약도 및 소화전 인프라 최적화 시스템",
@@ -486,384 +486,22 @@ def get_region_coordinates(region_name: str):
     return None
 
 
-def build_fire_patrol_route(df: pd.DataFrame, all_df: pd.DataFrame = None, map_style: str = "라이트 모드 (CartoDB Positron)"):
-    # folium이 없으면 pydeck으로 대체
+def build_fire_patrol_route(df: pd.DataFrame):
     if not FOLIUM_AVAILABLE:
-        return build_pydeck_route(df, all_df)
+        return None, df["취약_지수"].mean() if "취약_지수" in df.columns else 0.0, df
 
     df = convert_numeric_route_columns(df)
-    mean_vuln = df["취약_지수"].mean() if not df["취약_지수"].isna().all() else 50.0
+    mean_vuln = df["취약_지수"].mean()
 
-    # 선택된 지역의 데이터만 사용 (all_df는 무시)
-    target_df = df
-    
-    # 취약 지수가 높은 지역만 필터링 (평균 이상)
-    vuln_threshold = mean_vuln
-    high_vuln_df = target_df[target_df["취약_지수"] >= vuln_threshold].copy()
-    if high_vuln_df.empty:
-        high_vuln_df = target_df.copy()  # 데이터가 없으면 전체 사용
-    
-    # 취약 지수 내림차순(가장 취약한 위험지부터)으로 정렬하여 내비게이션 순서 결정
-    high_vuln_df = high_vuln_df.sort_values(by="취약_지수", ascending=False).reset_index(drop=True)
-    
-    # 취약 지수가 높은 지역의 좌표만 추출
-    all_points = []
-    for _, row in high_vuln_df.iterrows():
-        lat = None
-        lon = None
-        # latitude/longitude 컬럼이 있는지 확인
-        if "latitude" in row.index and "longitude" in row.index:
-            if not pd.isna(row.get("latitude")) and not pd.isna(row.get("longitude")):
-                try:
-                    lat = float(row.get("latitude"))
-                    lon = float(row.get("longitude"))
-                except Exception:
-                    pass
-        
-        # nearest_hydrant 좌표 사용
-        if (lat is None or lon is None) and "nearest_hydrant_lat" in row.index and "nearest_hydrant_lon" in row.index:
-            if not pd.isna(row.get("nearest_hydrant_lat")) and not pd.isna(row.get("nearest_hydrant_lon")):
-                try:
-                    lat = float(row.get("nearest_hydrant_lat"))
-                    lon = float(row.get("nearest_hydrant_lon"))
-                except Exception:
-                    pass
-        
-        # fallback 좌표 사용 (시도명 또는 시도명_full 컬럼 확인)
-        if lat is None or lon is None:
-            region_name = row.get("시도명") or row.get("시도명_full", "")
-            if region_name:
-                coords = get_region_coordinates(region_name)
-                if coords is not None:
-                    lat, lon = coords[0], coords[1]
-        
-        if lat is not None and lon is not None:
-            all_points.append({
-                "시도명": row["시도명"],
-                "취약_지수": row.get("취약_지수", np.nan),
-                "nearest_hydrant_km": row.get("nearest_hydrant_km", 0),
-                "latitude": lat,
-                "longitude": lon,
-                "출동_우선등급": row.get("출동_우선등급", ""),
-            })
-
-    # 지도 중심점 계산
-    center_lat, center_lon = 36.5, 127.5  # 기본값 (대한민국 중심)
-    if not all_points:
-        # df에서 좌표가 있는지 확인
-        if "latitude" in df.columns and "longitude" in df.columns:
-            valid_coords = df[["latitude", "longitude"]].dropna()
-            if not valid_coords.empty:
-                center_lat = valid_coords["latitude"].mean()
-                center_lon = valid_coords["longitude"].mean()
-        else:
-            # df_sido에서 첫 번째 지역의 좌표 찾기
-            try:
-                first_region = df["시도명"].iloc[0] if not df.empty else None
-                if first_region:
-                    coords = get_region_coordinates(first_region)
-                    if coords:
-                        center_lat, center_lon = coords
-            except Exception:
-                pass
-    else:
-        # all_points가 있으면 평균 계산
-        lats = [p["latitude"] for p in all_points]
-        lons = [p["longitude"] for p in all_points]
-        center_lat = sum(lats) / len(lats)
-        center_lon = sum(lons) / len(lons)
-    
-    # 지도 스타일에 따른 타일 지정
-    if map_style == "라이트 모드 (CartoDB Positron)":
-        tiles = "CartoDB positron"
-        attr = None
-    elif map_style == "다크 모드 (CartoDB Dark Matter)":
-        tiles = "CartoDB dark_matter"
-        attr = None
-    elif map_style == "위성 지도 (Esri Satellite)":
-        tiles = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
-        attr = "Esri"
-    else:
-        tiles = "OpenStreetMap"
-        attr = None
-
-    # 선택한 타일로 지도 생성
-    route_map = folium.Map(
-        location=[center_lat, center_lon], 
-        zoom_start=12 if all_points else 7,
-        tiles=tiles,
-        attr=attr
-    )
-    
-    # all_points가 있으면 마커 추가
-    if all_points:
-        # 경로 후보: 취약 지수가 높은 순으로 정렬 (평균 이상이면 모두 포함)
-        route_df = df[df["취약_지수"] >= mean_vuln].copy()
-        if route_df.empty:
-            route_df = df.copy()
-        
-        # 경로선도 취약 지수 높은 순서대로 연결하도록 정렬
-        route_df = route_df.sort_values(by="취약_지수", ascending=False).reset_index(drop=True)
-
-        # 출동 우선등급에 따라 색상 구분 및 번호가 들어간 마커 추가
-        for idx, point in enumerate(all_points, 1):
-            location = [point["latitude"], point["longitude"]]
-            vuln = point["취약_지수"] if not pd.isna(point["취약_지수"]) else 0
-            grade = point["출동_우선등급"]
-            
-            # 우선순위에 따른 아이콘 색상 (Hex 코드)
-            if "핵심" in grade or vuln >= mean_vuln:
-                icon_color_hex = "#D62728"  # 최우선 (빨강)
-            elif "집중" in grade or vuln >= mean_vuln * 0.8:
-                icon_color_hex = "#FF7F0E"  # 집중 (주황)
-            else:
-                icon_color_hex = "#1F77B4"  # 일반 (파랑)
-            
-            # 숫자(순번)를 렌더링하는 커스텀 HTML/CSS DivIcon 생성 (펄싱 효과 애니메이션 추가)
-            pulse_html = f"""
-            <div style="
-                position: absolute;
-                top: -4px;
-                left: -4px;
-                width: 40px;
-                height: 40px;
-                border-radius: 50%;
-                background-color: {icon_color_hex};
-                opacity: 0.45;
-                animation: marker-pulse 1.6s infinite ease-in-out;
-                z-index: 1;
-            "></div>
-            """ if idx == 1 or "핵심" in grade else ""
-
-            icon_html = f"""
-            <div style="position: relative; width: 32px; height: 32px;">
-                {pulse_html}
-                <div style="
-                    position: absolute;
-                    background-color: {icon_color_hex};
-                    color: white;
-                    border-radius: 50%;
-                    width: 32px;
-                    height: 32px;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    font-weight: bold;
-                    font-size: 15px;
-                    border: 2px solid white;
-                    box-shadow: 0px 3px 6px rgba(0,0,0,0.4);
-                    line-height: 1;
-                    z-index: 2;
-                ">
-                    {idx}
-                </div>
-            </div>
-            <style>
-            @keyframes marker-pulse {{
-                0% {{ transform: scale(0.9); opacity: 0.65; }}
-                50% {{ transform: scale(1.35); opacity: 0.05; }}
-                100% {{ transform: scale(0.9); opacity: 0.65; }}
-            }}
-            </style>
-            """
-
-            icon = folium.DivIcon(
-                html=icon_html,
-                icon_size=(32, 32),
-                icon_anchor=(16, 16)
-            )
-            
-            # 출발지 및 도착지 텍스트 수식 추가
-            prefix_title = ""
-            if idx == 1:
-                prefix_title = "[출발점] "
-            elif idx == len(all_points):
-                prefix_title = "[도착점] "
-            
-            popup_html = (
-                f"<strong>{idx}. {prefix_title}{point['시도명']}</strong><br>"
-                f"취약 지수: {vuln:.2f}<br>"
-                f"출동 등급: {grade}<br>"
-                f"nearest_hydrant_km: {point['nearest_hydrant_km']:.3f} km"
-            )
-            
-            folium.Marker(
-                location=location,
-                popup=folium.Popup(popup_html, max_width=300),
-                tooltip=f"{idx}. {prefix_title}{point['시도명']} (취약지수: {vuln:.2f})",
-                icon=icon,
-            ).add_to(route_map)
-
-        # 경로가 있으면 연결선 추가
-        if not route_df.empty:
-            route_points = []
-            for _, row in route_df.iterrows():
-                lat = None
-                lon = None
-                if "latitude" in row.index and not pd.isna(row.get("latitude")):
-                    try:
-                        lat = float(row.get("latitude"))
-                        lon = float(row.get("longitude"))
-                    except Exception:
-                        pass
-                if (lat is None or lon is None) and "nearest_hydrant_lat" in row.index and not pd.isna(row.get("nearest_hydrant_lat")):
-                    try:
-                        lat = float(row.get("nearest_hydrant_lat"))
-                        lon = float(row.get("nearest_hydrant_lon"))
-                    except Exception:
-                        pass
-                if lat is None or lon is None:
-                    region_name = row.get("시도명") or row.get("시도명_full", "")
-                    if region_name:
-                        coords = get_region_coordinates(region_name)
-                        if coords is not None:
-                            lat, lon = coords[0], coords[1]
-                if lat is not None and lon is not None:
-                    route_points.append([lat, lon])
-            
-            if len(route_points) > 1:
-                # 네온/글로우 스타일 이중 경로선으로 고급화
-                # 1. 외곽 글로우 라인
-                folium.PolyLine(
-                    route_points, 
-                    color="#D62728", 
-                    weight=10, 
-                    opacity=0.3
-                ).add_to(route_map)
-                
-                # 2. 내부 실선 라인
-                folium.PolyLine(
-                    route_points, 
-                    color="#FF4757", 
-                    weight=4, 
-                    opacity=0.9
-                ).add_to(route_map)
-    else:
-        # all_points가 없으면 기본 마커만 표시
-        display_name = df["시도명"].iloc[0] if not df.empty else "대한민국"
-        folium.Marker(
-            location=[center_lat, center_lon],
-            popup=f"<strong>{display_name}</strong><br>취약 지수: {mean_vuln:.2f}",
-            tooltip=display_name,
-            icon=folium.Icon(color="red", icon="star", prefix='fa')
-        ).add_to(route_map)
-
-    return route_map, mean_vuln, route_df
-
-
-def build_pydeck_route(df: pd.DataFrame, all_df: pd.DataFrame = None):
-    """folium이 없을 때 pydeck으로 대체 지도 생성"""
-    df = convert_numeric_route_columns(df)
-    mean_vuln = df["취약_지수"].mean() if not df["취약_지수"].isna().all() else 50.0
-    
-    # 좌표 추출
-    all_points = []
-    for _, row in df.iterrows():
-        lat = None
-        lon = None
-        if "latitude" in row.index and "longitude" in row.index:
-            if not pd.isna(row.get("latitude")) and not pd.isna(row.get("longitude")):
-                try:
-                    lat = float(row.get("latitude"))
-                    lon = float(row.get("longitude"))
-                except Exception:
-                    pass
-        if (lat is None or lon is None) and "nearest_hydrant_lat" in row.index and "nearest_hydrant_lon" in row.index:
-            if not pd.isna(row.get("nearest_hydrant_lat")) and not pd.isna(row.get("nearest_hydrant_lon")):
-                try:
-                    lat = float(row.get("nearest_hydrant_lat"))
-                    lon = float(row.get("nearest_hydrant_lon"))
-                except Exception:
-                    pass
-        if lat is None or lon is None:
-            region_name = row.get("시도명") or row.get("시도명_full", "")
-            if region_name:
-                coords = get_region_coordinates(region_name)
-                if coords is not None:
-                    lat, lon = coords[0], coords[1]
-        if lat is not None and lon is not None:
-            all_points.append({
-                "시도명": row["시도명"],
-                "취약_지수": row.get("취약_지수", np.nan),
-                "nearest_hydrant_km": row.get("nearest_hydrant_km", 0),
-                "latitude": lat,
-                "longitude": lon,
-                "출동_우선등급": row.get("출동_우선등급", ""),
-            })
-    
-    # 전체 데이터의 모든 지점도 표시 (all_df가 제공된 경우)
-    if all_df is not None:
-        for _, row in all_df.iterrows():
-            lat = None
-            lon = None
-            if "latitude" in row.index and "longitude" in row.index:
-                if not pd.isna(row.get("latitude")) and not pd.isna(row.get("longitude")):
-                    try:
-                        lat = float(row.get("latitude"))
-                        lon = float(row.get("longitude"))
-                    except Exception:
-                        pass
-            if (lat is None or lon is None) and "nearest_hydrant_lat" in row.index and "nearest_hydrant_lon" in row.index:
-                if not pd.isna(row.get("nearest_hydrant_lat")) and not pd.isna(row.get("nearest_hydrant_lon")):
-                    try:
-                        lat = float(row.get("nearest_hydrant_lat"))
-                        lon = float(row.get("nearest_hydrant_lon"))
-                    except Exception:
-                        pass
-            if lat is None or lon is None:
-                region_name = row.get("시도명") or row.get("시도명_full", "")
-                if region_name:
-                    coords = get_region_coordinates(region_name)
-                    if coords is not None:
-                        lat, lon = coords[0], coords[1]
-            if lat is not None and lon is not None:
-                # 중복 체크
-                if not any(p["latitude"] == lat and p["longitude"] == lon for p in all_points):
-                    all_points.append({
-                        "시도명": row["시도명"],
-                        "취약_지수": row.get("취약_지수", np.nan),
-                        "nearest_hydrant_km": row.get("nearest_hydrant_km", 0),
-                        "latitude": lat,
-                        "longitude": lon,
-                        "출동_우선등급": row.get("출동_우선등급", ""),
-                    })
-    
-    if not all_points:
-        return None, mean_vuln, df
-    
-    # pydeck 데이터 준비
-    deck_data = pd.DataFrame(all_points)
-    deck_data["color_r"] = deck_data["취약_지수"].apply(lambda x: min(255, int(x * 5)) if not pd.isna(x) else 100)
-    deck_data["color_g"] = deck_data["취약_지수"].apply(lambda x: max(0, 255 - int(x * 5)) if not pd.isna(x) else 100)
-    
-    # 중심점 계산
-    center_lat = deck_data["latitude"].mean()
-    center_lon = deck_data["longitude"].mean()
-    
-    view_state = pdk.ViewState(
-        latitude=center_lat,
-        longitude=center_lon,
-        zoom=7,
-        pitch=0
-    )
-    
-    # 스캐터 레이어
-    scatter_layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=deck_data,
-        get_position=["longitude", "latitude"],
-        get_color="[color_r, color_g, 100, 200]",
-        get_radius=5000,
-        pickable=True,
-    )
-    
-    # 경로선 추가
-    route_df = df[df["취약_지수"] >= mean_vuln].copy()
+    route_df = df[df["취약_지수"] > mean_vuln].copy()
     if route_df.empty:
-        route_df = df.copy()
-    
+        return None, mean_vuln, route_df
+
+    route_df = route_df.sort_values(by="nearest_hydrant_km", ascending=False).reset_index(drop=True)
+
     route_points = []
     for _, row in route_df.iterrows():
+        # Prefer explicit latitude/longitude present in the navigation dataframe
         lat = None
         lon = None
         if "latitude" in row.index and not pd.isna(row.get("latitude")):
@@ -871,45 +509,59 @@ def build_pydeck_route(df: pd.DataFrame, all_df: pd.DataFrame = None):
                 lat = float(row.get("latitude"))
                 lon = float(row.get("longitude"))
             except Exception:
-                pass
+                lat = None
+                lon = None
+        # fall back to nearest_hydrant coords if available
         if (lat is None or lon is None) and "nearest_hydrant_lat" in row.index and not pd.isna(row.get("nearest_hydrant_lat")):
             try:
                 lat = float(row.get("nearest_hydrant_lat"))
                 lon = float(row.get("nearest_hydrant_lon"))
             except Exception:
-                pass
-        if lat is None or lon is None:
-            region_name = row.get("시도명") or row.get("시도명_full", "")
-            if region_name:
-                coords = get_region_coordinates(region_name)
-                if coords is not None:
-                    lat, lon = coords[0], coords[1]
-        if lat is not None and lon is not None:
-            route_points.append([lon, lat])
-    
-    layers = [scatter_layer]
-    
-    if len(route_points) > 1:
-        path_layer = pdk.Layer(
-            "PathLayer",
-            data=[{"path": route_points}],
-            get_path="path",
-            get_color=[255, 0, 0],
-            get_width=5,
-            get_opacity=0.8,
-        )
-        layers.append(path_layer)
-    
-    r = pdk.Deck(
-        layers=layers,
-        initial_view_state=view_state,
-        tooltip={
-            "text": "{시도명}\n취약 지수: {취약_지수}\n출동 등급: {출동_우선등급}\nnearest_hydrant_km: {nearest_hydrant_km} km"
-        }
-    )
-    
-    return r, mean_vuln, df
+                lat = None
+                lon = None
 
+        # lastly, attempt to resolve using province-level fallback mapping
+        if lat is None or lon is None:
+            coords = get_region_coordinates(row["시도명"]) if "시도명" in row.index else None
+            if coords is not None:
+                lat, lon = coords[0], coords[1]
+
+        if lat is None or lon is None:
+            # skip entries we cannot geolocate
+            continue
+
+        route_points.append({
+            "시도명": row["시도명"],
+            "취약_지수": row["취약_지수"],
+            "nearest_hydrant_km": row["nearest_hydrant_km"],
+            "latitude": lat,
+            "longitude": lon,
+        })
+
+    if not route_points:
+        return None, mean_vuln, route_df
+
+    first_point = route_points[0]
+    route_map = folium.Map(location=[first_point["latitude"], first_point["longitude"]], zoom_start=7)
+
+    path = []
+    for idx, point in enumerate(route_points, start=1):
+        location = [point["latitude"], point["longitude"]]
+        popup_html = (
+            f"<strong>{point['시도명']}</strong><br>"
+            f"취약 지수: {point['취약_지수']:.2f}<br>"
+            f"nearest_hydrant_km: {point['nearest_hydrant_km']:.3f} km"
+        )
+        folium.Marker(
+            location=location,
+            popup=folium.Popup(popup_html, max_width=300),
+            tooltip=f"{idx}. {point['시도명']}",
+            icon=folium.Icon(color="red" if idx == 1 else "blue"),
+        ).add_to(route_map)
+        path.append(location)
+
+    folium.PolyLine(path, color="red", weight=5, opacity=0.8).add_to(route_map)
+    return route_map, mean_vuln, route_df
 
 # 출동 우선등급(Top20%) 및 네비게이션 후보 계산
 #  - 출동_우선등급: 취약지수 상위 20% -> A, 나머지 -> B
@@ -993,7 +645,7 @@ if menu == "1️⃣ Phase 1 | 핵심 분석 지표 도출":
         st.info("소방시설 설치 및 관리에 관한 법률 시행령 (소화전 설치 기준 및 거리 준수)")
     with col_info_2:
         st.markdown("**📚 데이터 출처**")
-        st.info("국가화재정보시스템(NFDS) 전문가 설문 및 가중치 분석 연구")
+        st.info("국가화재정보시스템(NFDS) 전문가 설문 및 가중치 분석 연구\n\n[MDPI 논문 참고](https://www.mdpi.com/2571-6255/6/3/107)")
 
     st.divider()
 
@@ -1044,15 +696,196 @@ if menu == "1️⃣ Phase 1 | 핵심 분석 지표 도출":
 elif menu == "2️⃣ Phase 2 | 시각화 기반 분석 심층화":
     st.header("📊 Phase 2: 취약지수에 따른 데이터 분석")
     
-    st.sidebar.subheader("📍 지역 필터")
-    selected_sidos = st.sidebar.multiselect(
-        "분석할 시도를 선택하세요", 
-        options=sorted(df_sido["시도명_full"].unique()),
-        default=sorted(df_sido["시도명_full"].unique())[:3]
+    # 분석 레벨 선택 (시/도 or 시/군/구)
+    st.sidebar.subheader("📊 분석 레벨 선택")
+    analysis_level = st.sidebar.radio(
+        "분석 단위를 선택하세요",
+        ["시/도 단위", "시/군/구 단위"]
     )
     
-    display_df = df_sido[df_sido["시도명_full"].isin(selected_sidos)]
+    if analysis_level == "시/도 단위":
+        st.sidebar.subheader("📍 지역 필터")
+        selected_sidos = st.sidebar.multiselect(
+            "분석할 시도를 선택하세요", 
+            options=sorted(df_sido["시도명_full"].unique()),
+            default=sorted(df_sido["시도명_full"].unique())[:3]
+        )
+        display_df = df_sido[df_sido["시도명_full"].isin(selected_sidos)]
+    else:
+        # 시/군/구 단위 분석
+        st.sidebar.subheader("📍 시/도 선택")
+        selected_sido_for_gu = st.sidebar.selectbox(
+            "분석할 시도를 선택하세요",
+            options=sorted(df_sido["시도명_full"].unique())
+        )
+        
+        # 시/군/구 데이터 로드 (최종 수정 버전)
+        @st.cache_data
+        def load_sigungu_data():
+            """시/군/구 단위 데이터 로드 및 처리"""
+            try:
+                # 화재 데이터 로드 - 헤더 없이 읽고 직접 컬럼명 지정
+                df_fire_raw = pd.read_csv('화재발생.csv', encoding='utf-8-sig', header=None)
+                # 첫 번째 행이 헤더인지 확인
+                if '행정구역' in str(df_fire_raw.iloc[0, 0]):
+                    df_fire_raw = df_fire_raw.iloc[1:].reset_index(drop=True)
+                
+                # 새 DataFrame 생성 (컬럼명 명시적 지정)
+                df_fire = pd.DataFrame()
+                df_fire['시도명'] = df_fire_raw.iloc[:, 0].astype(str)
+                df_fire['시군구명'] = df_fire_raw.iloc[:, 1].astype(str)
+                df_fire['화재발생건수_C'] = pd.to_numeric(df_fire_raw.iloc[:, 2], errors='coerce')
+                df_fire = df_fire[df_fire['시군구명'] != '소계'].copy()
+                
+                # 면적 데이터 로드 - 헤더 없이 읽고 직접 컬럼명 지정
+                df_area_raw = pd.read_csv('전국면적.csv', encoding='utf-8-sig', header=None)
+                # 첫 번째 행이 헤더인지 확인
+                if '소재지' in str(df_area_raw.iloc[0, 0]):
+                    df_area_raw = df_area_raw.iloc[1:].reset_index(drop=True)
+                
+                # 새 DataFrame 생성
+                df_area = pd.DataFrame()
+                df_area['지역명'] = df_area_raw.iloc[:, 0].astype(str)
+                df_area['면적_B'] = pd.to_numeric(df_area_raw.iloc[:, 1], errors='coerce')
+                
+                # 시도명 추출 함수
+                sidos = df_sido["시도명_full"].unique().tolist()
+                def extract_sido(name):
+                    for sido in sidos:
+                        if name.startswith(sido):
+                            return sido
+                    return None
+                
+                df_area['시도명'] = df_area['지역명'].apply(extract_sido)
+                df_area['시군구명'] = df_area['지역명']
+                df_area = df_area[df_area['시도명'].notna()].copy()
+                
+                # 전체 지역명 생성
+                df_fire['전체지역명'] = df_fire['시도명'] + ' ' + df_fire['시군구명']
+                
+                # 데이터 병합
+                merged = pd.merge(
+                    df_fire[['시도명', '시군구명', '전체지역명', '화재발생건수_C']],
+                    df_area[['시도명', '시군구명', '면적_B']],
+                    on=['시도명', '시군구명'],
+                    how='inner'
+                )
+                
+                # 소화전 데이터 추가
+                if os.path.exists('소화전.csv'):
+                    df_hydrants = pd.read_csv('소화전.csv', encoding='utf-8-sig')
+                    if '소재지도로명주소' in df_hydrants.columns:
+                        def extract_sigungu(addr):
+                            if not isinstance(addr, str):
+                                return None
+                            parts = addr.split()
+                            return ' '.join(parts[:3]) if len(parts) >= 3 else None
+                        
+                        df_hydrants['전체지역명'] = df_hydrants['소재지도로명주소'].apply(extract_sigungu)
+                        hydrant_counts = df_hydrants.groupby('전체지역명').size().reset_index(name='소화전개소_A')
+                        merged = pd.merge(merged, hydrant_counts, on='전체지역명', how='left')
+                    else:
+                        merged['소화전개소_A'] = 0
+                else:
+                    merged['소화전개소_A'] = 0
+                
+                merged['소화전개소_A'] = merged['소화전개소_A'].fillna(0)
+                
+                # 지표 계산
+                merged['소화전_밀도_D'] = (merged['소화전개소_A'] / merged['면적_B']).round(2)
+                merged['화재_발생_밀도_E'] = (merged['화재발생건수_C'] / merged['면적_B']).round(3)
+                merged['취약_지수'] = (
+                    (merged['화재_발생_밀도_E'] * 0.6) + 
+                    ((1 / merged['소화전_밀도_D'].replace(0, np.nan)).fillna(0) * 0.4)
+                ).round(2)
+                merged['법적기준_미달율'] = (
+                    (merged['면적_B'] / merged['소화전개소_A'].replace(0, np.nan)) * 300 + 12
+                ).fillna(89.2).clip(lower=8.5, upper=89.2).round(1)
+                
+                # 좌표 추가 (서울시 구만)
+                sgg_coords = {
+                    "종로구": (37.5735, 126.9786), "중구": (37.5641, 126.9970), "용산구": (37.5326, 126.9907),
+                    "성동구": (37.5505, 127.0408), "광진구": (37.5384, 127.0843), "동대문구": (37.5744, 127.0396),
+                    "중랑구": (37.6063, 127.0932), "성북구": (37.5894, 127.0167), "강북구": (37.6396, 127.0257),
+                    "도봉구": (37.6688, 127.0471), "노원구": (37.6542, 127.0568), "은평구": (37.6176, 126.9227),
+                    "서대문구": (37.5815, 126.9357), "마포구": (37.5663, 126.9014), "양천구": (37.5170, 126.8664),
+                    "강서구": (37.5509, 126.8495), "구로구": (37.4955, 126.8877), "금천구": (37.4606, 126.9006),
+                    "영등포구": (37.5264, 126.8962), "동작구": (37.5124, 126.9393), "관악구": (37.4783, 126.9416),
+                    "서초구": (37.4837, 127.0324), "강남구": (37.5172, 127.0473), "송파구": (37.5145, 127.1066),
+                    "강동구": (37.5302, 127.1238),
+                }
+                merged['위도'] = merged['시군구명'].map(lambda x: sgg_coords.get(x, (None, None))[0])
+                merged['경도'] = merged['시군구명'].map(lambda x: sgg_coords.get(x, (None, None))[1])
+                
+                return merged
+            except Exception as e:
+                st.error(f"데이터 로드 오류: {e}")
+                return pd.DataFrame()
+        
+        df_sigungu = load_sigungu_data()
+        
+        if not df_sigungu.empty:
+            # 컬럼명 확인 및 디버깅
+            # st.write("df_sigungu columns:", df_sigungu.columns.tolist())
+            
+            # 선택된 시도의 시/군/구 데이터만 필터링
+            display_df = df_sigungu[df_sigungu['시도명'] == selected_sido_for_gu].copy()
+            display_df['시도명_full'] = display_df['전체지역명']
+            
+            # 필수 컬럼 확인 및 대체
+            if '화재발생건수_C' not in display_df.columns:
+                # 디버깅 정보 표시
+                st.error(f"필수 컬럼 '화재발생건수_C'가 없습니다. 현재 컬럼: {display_df.columns.tolist()}")
+                # 수치 컬럼 찾아서 이름 변경
+                numeric_cols = display_df.select_dtypes(include=[np.number]).columns.tolist()
+                if len(numeric_cols) > 0:
+                    display_df = display_df.rename(columns={numeric_cols[0]: '화재발생건수_C'})
+                    st.warning(f"'{numeric_cols[0]}' 컬럼을 '화재발생건수_C'로 변경했습니다.")
+                else:
+                    display_df = pd.DataFrame()
+                    st.error("수치 데이터를 찾을 수 없습니다.")
+        else:
+            display_df = pd.DataFrame()
+            st.warning("시/군/구 데이터를 불러올 수 없습니다.")
 
+    # 데이터가 비어있으면 메시지 표시
+    if display_df.empty:
+        st.warning("표시할 데이터가 없습니다. 시/군/구 데이터 로드에 실패했을 수 있습니다.")
+        st.stop()
+    
+    # 필수 컬럼 확인 및 최종 수정
+    if '화재발생건수_C' not in display_df.columns:
+        st.error("화재발생건수_C 컬럼이 최종적으로 없습니다. 데이터 구조를 확인합니다.")
+        st.write("현재 컬럼:", display_df.columns.tolist())
+        # 마지막 시도: 수치 컬럼을 찾아서 이름 변경
+        numeric_cols = display_df.select_dtypes(include=[np.number]).columns.tolist()
+        if len(numeric_cols) > 0:
+            display_df['화재발생건수_C'] = display_df[numeric_cols[0]]
+            st.warning(f"'{numeric_cols[0]}'을(를) '화재발생건수_C'로 사용합니다.")
+        else:
+            st.error("수치 데이터를 찾을 수 없습니다.")
+            st.stop()
+    
+    # 다른 필수 컬럼들도 확인
+    if '소화전_밀도_D' not in display_df.columns:
+        display_df['소화전_밀도_D'] = 0.0
+    if '취약_지수' not in display_df.columns:
+        display_df['취약_지수'] = 50.0
+    
+    # 화재발생건수_C 컬럼 최종 확인 및 강제 생성
+    if '화재발생건수_C' not in display_df.columns:
+        st.error("치명적 오류: 화재발생건수_C 컬럼이 없습니다.")
+        st.write("현재 컬럼 목록:", display_df.columns.tolist())
+        st.write("데이터 타입:", display_df.dtypes)
+        # 마지막 시도: 모든 수치 컬럼을 찾아서 사용
+        numeric_cols = display_df.select_dtypes(include=[np.number]).columns.tolist()
+        if len(numeric_cols) > 0:
+            st.warning(f"'{numeric_cols[0]}' 컬럼을 화재발생건수_C로 강제 지정합니다.")
+            display_df['화재발생건수_C'] = display_df[numeric_cols[0]]
+        else:
+            st.error("사용 가능한 수치 컬럼이 없습니다. 데이터를 확인하세요.")
+            st.stop()
+    
     # (차트) 상위 취약 지역
     median_fire = display_df["화재발생건수_C"].median()
     median_density = display_df["소화전_밀도_D"].median()
@@ -1098,11 +931,18 @@ elif menu == "2️⃣ Phase 2 | 시각화 기반 분석 심층화":
     highest_v = display_df.loc[display_df["취약_지수"].idxmax()]
     lowest_v = display_df.loc[display_df["취약_지수"].idxmin()]
     
-    analysis_text = f"""
-    - **전체 요약:** 선택된 {len(selected_sidos)}개 시도 중 **{highest_v['시도명']}**이(가) 취약 지수 {highest_v['취약_지수']:.2f}로 가장 위험도가 높은 것으로 분석되었습니다.
-    - **최우선 관리 대상:** 화재 빈도가 중위값({median_fire:.0f}건) 이상이면서 소화전 밀도가 중위값({median_density:.2f}개/km²) 이하인 지역은 집중 관리가 필요합니다.
-    - **인프라 결핍:** 취약 지수가 높은 지역은 주로 화재 발생 밀도가 급증함에도 불구하고 소화전 확충 속도가 따라가지 못하는 경향을 보입니다.
-    """
+    if analysis_level == "시/도 단위":
+        analysis_text = f"""
+        - **전체 요약:** 선택된 {len(selected_sidos)}개 시도 중 **{highest_v['시도명']}**이(가) 취약 지수 {highest_v['취약_지수']:.2f}로 가장 위험도가 높은 것으로 분석되었습니다.
+        - **최우선 관리 대상:** 화재 빈도가 중위값({median_fire:.0f}건) 이상이면서 소화전 밀도가 중위값({median_density:.2f}개/km²) 이하인 지역은 집중 관리가 필요합니다.
+        - **인프라 결핍:** 취약 지수가 높은 지역은 주로 화재 발생 밀도가 급증함에도 불구하고 소화전 확충 속도가 따라가지 못하는 경향을 보입니다.
+        """
+    else:
+        analysis_text = f"""
+        - **전체 요약:** **{selected_sido_for_gu}**의 {len(display_df)}개 시/군/구 중 **{highest_v['시군구명']}**이(가) 취약 지수 {highest_v['취약_지수']:.2f}로 가장 위험도가 높은 것으로 분석되었습니다.
+        - **최우선 관리 대상:** 화재 빈도가 중위값({median_fire:.0f}건) 이상이면서 소화전 밀도가 중위값({median_density:.2f}개/km²) 이하인 지역은 집중 관리가 필요합니다.
+        - **인프라 결핍:** 취약 지수가 높은 지역은 주로 화재 발생 밀도가 급증함에도 불구하고 소화전 확충 속도가 따라가지 못하는 경향을 보입니다.
+        """
     st.info(analysis_text)
 
 # ------------------------------------------
@@ -1114,197 +954,57 @@ elif menu == "3️⃣ Phase 3 | 해결 전략 & 우선순위 제언":
     st.subheader("🎯 출동 우선순위 및 내비게이션 전략")
     st.write("2페이지의 분석 결과에 따라 화재 위험 밀도가 높고 인프라가 부족한 '🚨 최우선 관리' 지역을 1순위 출동 및 순찰 지역으로 설정합니다.")
 
-    # 내비게이션 시도 및 지도 스타일 선택 (가로 배치)
-    col_select1, col_select2 = st.columns(2)
-    with col_select1:
-        nav_sido_val = st.selectbox("시/도 선택", options=sorted(df_sido["시도명_full"].unique()))
-        display_name = nav_sido_val
-    with col_select2:
-        map_style = st.selectbox(
-            "🗺️ 지도 테마 스타일 선택",
-            [
-                "라이트 모드 (CartoDB Positron)",
-                "다크 모드 (CartoDB Dark Matter)",
-                "위성 지도 (Esri Satellite)",
-                "기본 지도 (OpenStreetMap)"
-            ]
-        )
+    # 내비게이션 시도 선택
+    nav_sido_val = st.selectbox("시/도 선택", options=sorted(df_sido["시도명_full"].unique()))
+    nav_filtered_df = navigation_df[navigation_df["시도명_full"] == nav_sido_val]
+    display_name = nav_sido_val
     
-    # hydrant_points에서 선택된 지역의 데이터 가져오기 (시군구 단위)
-    if hydrant_points is not None and '시도명_std' in hydrant_points.columns:
-        hydrant_filtered = hydrant_points[hydrant_points['시도명_std'] == nav_sido_val]
-        if not hydrant_filtered.empty:
-            # 취약 지수가 높은 소화전만 필터링 (상위 20%만 사용)
-            vuln_threshold = df_sido[df_sido['시도명_full'] == nav_sido_val]['취약_지수'].iloc[0] if not df_sido[df_sido['시도명_full'] == nav_sido_val].empty else 50.0
-            
-            # 소화전 좌표에 취약 지수 할당 (임의로 분산)
-            np.random.seed(42)
-            hydrant_filtered = hydrant_filtered.copy()
-            hydrant_filtered['취약_지수'] = np.random.normal(
-                vuln_threshold, 
-                vuln_threshold * 0.3, 
-                len(hydrant_filtered)
-            )
-            hydrant_filtered['취약_지수'] = hydrant_filtered['취약_지수'].clip(lower=0, upper=100)
-            
-            # 취약 지수가 높은 소화전만 선택 (상위 20%만 - 더 엄격한 필터링)
-            high_vuln_threshold = hydrant_filtered['취약_지수'].quantile(0.8)
-            high_vuln_hydrants = hydrant_filtered[hydrant_filtered['취약_지수'] >= high_vuln_threshold]
-            
-            # 최대 10개만 선택 (너무 많은 마커 방지)
-            if len(high_vuln_hydrants) > 10:
-                high_vuln_hydrants = high_vuln_hydrants.nlargest(10, '취약_지수')
-            
-            st.caption(f"ℹ️ '{nav_sido_val}'의 고위험 소화전 좌표를 사용합니다. (총 {len(hydrant_filtered)}개 중 상위 {len(high_vuln_hydrants)}개)")
-            
-            # 주소 컬럼 식별 및 정화
-            addr_col = next((c for c in ['소재지도로명주소', '도로명주소', '지번주소', '설치위치', '설치장소', '주소'] if c in high_vuln_hydrants.columns), None)
-            
-            def clean_addr(addr):
-                if not isinstance(addr, str):
-                    return str(addr)
-                # 소재지 정보에서 불필요한 시도 중복 접두사 제거
-                prefixes = [nav_sido_val, "서울특별시", "부산광역시", "대구광역시", "인천광역시", "광주광역시", "대전광역시", "울산광역시", "세종특별자치시", "경기도", "강원특별자치도", "충청북도", "충청남도", "전북특별자치도", "전라남도", "경상북도", "경상남도", "제주특별자치도", "강원도", "전라북도", "충북", "충남", "전북", "전남", "경북", "경남", "제주"]
-                for p in prefixes:
-                    if addr.startswith(p):
-                        addr = addr[len(p):].strip()
-                        break
-                return addr
-
-            if addr_col:
-                display_names = high_vuln_hydrants[addr_col].apply(clean_addr)
-            else:
-                display_names = high_vuln_hydrants['시도명_std']
-
-            # 필요한 컬럼만 추출
-            nav_filtered_df = pd.DataFrame({
-                '시도명': display_names,
-                '시도명_full': high_vuln_hydrants['시도명_std'],
-                'latitude': high_vuln_hydrants['latitude'],
-                'longitude': high_vuln_hydrants['longitude'],
-                'nearest_hydrant_km': 0.0,
-                '출동_우선등급': '',
-                '취약_지수': high_vuln_hydrants['취약_지수']
-            })
-        else:
-            # hydrant_points에 해당 지역이 없으면 df_sido에서 가져오기
-            st.caption("ℹ️ 개별 소화전 좌표 데이터가 없어 시도 단위 데이터로 경로를 생성합니다.")
-            nav_filtered_df = df_sido[df_sido["시도명_full"] == nav_sido_val].copy()
-            if nav_filtered_df.empty:
-                st.warning(f"⚠️ '{nav_sido_val}' 지역 데이터를 찾을 수 없습니다.")
-                nav_filtered_df = df_sido.copy()
-    else:
-        # hydrant_points가 없으면 df_sido에서 가져오기
+    # navigation_df가 비어있으면 df_sido에서 직접 필터링하여 사용
+    if nav_filtered_df.empty and not df_sido[df_sido["시도명_full"] == nav_sido_val].empty:
         st.caption("ℹ️ 개별 소화전 좌표 데이터가 없어 시도 단위 데이터로 경로를 생성합니다.")
+        # df_sido에서 필요한 컬럼만 추출하여 navigation_df 형태로 변환
         nav_filtered_df = df_sido[df_sido["시도명_full"] == nav_sido_val].copy()
-        if nav_filtered_df.empty:
-            st.warning(f"⚠️ '{nav_sido_val}' 지역 데이터를 찾을 수 없습니다.")
-            nav_filtered_df = df_sido.copy()
+        # 필요한 컬럼들이 있는지 확인하고 없으면 추가
+        if "nearest_hydrant_km" not in nav_filtered_df.columns:
+            nav_filtered_df["nearest_hydrant_km"] = 0.0
+        if "출동_우선등급" not in nav_filtered_df.columns:
+            nav_filtered_df["출동_우선등급"] = ""
     
-    # nav_filtered_df가 여전히 비어있으면 df_sido 전체 사용
-    if nav_filtered_df.empty:
-        nav_filtered_df = df_sido.copy()
+    # 디버깅 정보 표시
+    with st.expander("🔍 디버깅 정보"):
+        st.write(f"선택된 시도: {nav_sido_val}")
+        st.write(f"navigation_df 전체 크기: {len(navigation_df)}")
+        st.write(f"필터링된 데이터 크기: {len(nav_filtered_df)}")
+        if not nav_filtered_df.empty:
+            st.write("필터링된 데이터 컬럼:", nav_filtered_df.columns.tolist())
+            st.dataframe(nav_filtered_df[["시도명", "취약_지수", "nearest_hydrant_km", "latitude", "longitude"]])
     
-    # 좌표 컬럼이 없는 경우 추가
-    if "latitude" not in nav_filtered_df.columns or "longitude" not in nav_filtered_df.columns:
-        coords_list = []
-        for idx, row in nav_filtered_df.iterrows():
-            region_name = row.get("시도명") or row.get("시도명_full", "")
-            coords = get_region_coordinates(region_name) if region_name else None
-            if coords:
-                nav_filtered_df.at[idx, "latitude"] = coords[0]
-                nav_filtered_df.at[idx, "longitude"] = coords[1]
-    
-    # 항상 지도 표시 시도 (선택된 지역 데이터 및 선택된 지도 스타일 사용)
-    route_map, mean_v, route_df = build_fire_patrol_route(nav_filtered_df, map_style=map_style)
-    
-    # route_map이 None이고 folium이 사용 가능하면 직접 기본 지도 생성
-    if route_map is None and FOLIUM_AVAILABLE and folium is not None:
-        coords = get_region_coordinates(nav_sido_val)
-        if coords:
-            # 선택한 지도 스타일 적용
-            if map_style == "라이트 모드 (CartoDB Positron)":
-                tiles = "CartoDB positron"
-                attr = None
-            elif map_style == "다크 모드 (CartoDB Dark Matter)":
-                tiles = "CartoDB dark_matter"
-                attr = None
-            elif map_style == "위성 지도 (Esri Satellite)":
-                tiles = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
-                attr = "Esri"
-            else:
-                tiles = "OpenStreetMap"
-                attr = None
-            route_map = folium.Map(location=[coords[0], coords[1]], zoom_start=12, tiles=tiles, attr=attr)
-            folium.Marker(
-                location=[coords[0], coords[1]],
-                popup=f"<strong>{display_name}</strong><br>취약 지수: {mean_v:.2f}",
-                tooltip=display_name,
-                icon=folium.Icon(color="red", icon="star")
-            ).add_to(route_map)
+    route_map, mean_v, route_df = build_fire_patrol_route(nav_filtered_df)
 
     col_nav, col_detail = st.columns([3, 2])
     with col_nav:
         st.markdown(f"**🚒 {display_name} 순찰 최적화 경로**")
         
-        # 내비게이션 지도 표시
+        # 디버깅: 경로 정보 표시
+        if not route_df.empty:
+            st.caption(f"평균 취약 지수: {mean_v:.2f} | 선정된 경로 지점: {len(route_df)}개")
+        
         if route_map is not None:
-            st.markdown("**🗺️ 출동 최적화 경로**")
-            if FOLIUM_AVAILABLE and st_folium:
-                st_folium(route_map, width=700, height=500)
-            elif FOLIUM_AVAILABLE:
-                # folium은 있지만 streamlit-folium이 없는 경우
-                st.warning("folium이 설치되었지만 streamlit-folium이 없어 지도 표시가 제한됩니다.")
+            if st_folium:
+                st_folium(route_map, width=700, height=450)
             else:
-                # pydeck 지도 표시
-                st.pydeck_chart(route_map, use_container_width=True)
+                st.warning("folium이 설치되지 않았습니다.")
         else:
-            st.warning(f"⚠️ '{display_name}' 지역의 지도를 표시할 수 없습니다.")
-            st.info("다른 지역을 선택하거나 잠시 후 다시 시도해주세요.")
+            if nav_filtered_df.empty:
+                st.warning(f"⚠️ '{nav_sido_val}'에 대한 네비게이션 데이터가 없습니다. navigation_df가 비어있습니다.")
+            else:
+                st.info("해당 지역에 대한 경로 데이터가 부족합니다. 취약 지수가 평균 이하이거나 좌표 정보가 없을 수 있습니다.")
 
+        if not route_df.empty:
+            st.markdown("**📋 상세 순찰 지점 리스트**")
+            st.dataframe(route_df[["시도명", "취약_지수", "nearest_hydrant_km"]], use_container_width=True)
 
     with col_detail:
-        st.markdown("### 🛞 단계별 출동/순찰 경로 가이드")
-        
-        if route_df is not None and not route_df.empty:
-            for idx, (_, row) in enumerate(route_df.iterrows(), 1):
-                name = row['시도명']
-                vuln = row['취약_지수']
-                
-                # 순번에 따른 마커/타이틀 설정
-                if idx == 1:
-                    prefix = "🚒 **[1순위 / 출발점]**"
-                    color_status = "#D62728"  # 빨강
-                elif idx == len(route_df):
-                    prefix = "🏁 **[최종 / 도착점]**"
-                    color_status = "#1F77B4"  # 파랑
-                else:
-                    prefix = f"📍 **[{idx}순위 / 경유지]**"
-                    color_status = "#FF7F0E"  # 주황
-                
-                # 세련된 내비게이션 노드 디자인
-                st.markdown(
-                    f"""
-                    <div style="
-                        background-color: #f8f9fa;
-                        border-left: 5px solid {color_status};
-                        padding: 12px;
-                        margin-bottom: 10px;
-                        border-radius: 4px;
-                        box-shadow: 0px 1px 3px rgba(0,0,0,0.1);
-                    ">
-                        <div style="font-size: 14px; font-weight: bold; color: #2d3436;">{prefix} {name}</div>
-                        <div style="font-size: 13px; color: #636e72; margin-top: 4px;">
-                            화재 취약 지수: <strong>{vuln:.2f}</strong>
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-        else:
-            st.info("선택된 지역의 경로 정보가 없습니다.")
-            
-        st.markdown("---")
         st.markdown("**📌 우선순위 활용 방향**")
         st.markdown("""
         1. **내비게이션 연동:** 소방차 출동 시 취약 지수가 높은 구역을 경유하거나 피하는 최적 경로 안내에 활용.

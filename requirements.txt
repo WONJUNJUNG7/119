@@ -3,5 +3,3 @@ pandas
 numpy
 pydeck
 plotly
-folium
-streamlit-folium
